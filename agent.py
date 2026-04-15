@@ -16,6 +16,10 @@ load_dotenv(Path(__file__).parent / ".env")
 client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
 
 MODEL = os.environ.get("ODIUM_MODEL", "claude-haiku-4-5")  # haiku for cost; sonnet for quality
+# Display truncation for tool results printed to terminal (does NOT affect
+# what the agent sees — that's controlled by MAX_TOOL_OUTPUT).
+# Default 500 chars. Set high (e.g. 999999) to see everything.
+DISPLAY_LIMIT = int(os.environ.get("ODIUM_DISPLAY", "500"))
 
 SYSTEM_PROMPT = """\
 You are odium, a drone survey pipeline assistant. You help surveyors
@@ -75,7 +79,18 @@ that preceding stages are complete.
                    orthophoto, point cloud, targets overlay, uncertainty.
   QGIS_DESIGN      QGIS review in customer design grid coordinates.
                    Verify deliverables match customer expectations.
-  PACKAGED         packager.py — reproject + shift to design grid, COG
+  PACKAGED         packager.py — reproject + shift to design grid, COG.
+                   Output goes to deliverables/ in the job dir with
+                   customer-friendly names:
+                     orthophoto.tif  — the deliverable orthophoto
+                     accuracy.html  — copy of the RMSE report
+                   Do NOT expose internal naming to customers (no
+                   odm_orthophoto.original_cog_cog.tif etc).
+                   Prefer a COG as input — COG internal tiling makes
+                   reads faster. However, reprojection (e.g. UTM →
+                   State Plane) is still pixel-by-pixel work: expect
+                   10–20 min for a 2 GB ortho. No AWS cost.
+                   Default output format is COG (--web-optimized).
                    NEVER skip RMSE to go directly to packaging.
   DELIVERED        Artifacts placed in Google Drive folder, customer
                    emailed.
@@ -196,6 +211,7 @@ These are the STANDARD names produced by the pipeline tools. When running
 pipeline steps yourself, always use these names for outputs.
 
 ## Standard names (what the tools produce)
+- Deliverables go in `deliverables/` in the job directory
 - `{customer}_{job}.dc` or `{job}.dc` — Trimble data collector input
 - `{job}_{epsg}.csv` — survey coords in field CRS (from transform.py dc)
 - `{job}_design.csv` — design-grid coords (from transform.py dc)
@@ -338,6 +354,63 @@ TOOLS = [
                 },
             },
             "required": ["tagged_path"],
+        },
+    },
+    {
+        "name": "run_package",
+        "description": "Run packager to produce customer deliverables. Reprojects "
+                       "orthophoto to design-grid CRS, applies scale + shift from "
+                       "transform.yaml, and outputs a Cloud Optimized GeoTIFF (COG). "
+                       "Auto-loads transform.yaml from the input file directory. "
+                       "Default output is deliverables/ in the job dir as COG. "
+                       "Reprojection is pixel-by-pixel — expect 10-20 min for a "
+                       "2 GB ortho. No AWS cost (runs locally). "
+                       "Can also process contour DXF and TIN XML files.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tif_file": {
+                    "type": "string",
+                    "description": "Input orthophoto GeoTIFF to package",
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Output directory (default: {input}_tiles/)",
+                },
+                "web_optimized": {
+                    "type": "boolean",
+                    "description": "Output a Cloud Optimized GeoTIFF (COG) instead of tiles",
+                },
+                "no_tile": {
+                    "type": "boolean",
+                    "description": "Output a single GeoTIFF instead of tiles",
+                },
+                "contour_file": {
+                    "type": "string",
+                    "description": "Input .dxf contour file to reproject",
+                },
+                "tin_file": {
+                    "type": "string",
+                    "description": "Input LandXML .xml TIN file to reproject",
+                },
+                "transform_yaml": {
+                    "type": "string",
+                    "description": "Override transform.yaml path (normally auto-detected)",
+                },
+                "crs": {
+                    "type": "string",
+                    "description": "Override target CRS (e.g. EPSG:3618). Normally from transform.yaml.",
+                },
+                "downsize_gsd": {
+                    "type": "number",
+                    "description": "Target Ground Sample Distance in map units (for downsizing large orthos)",
+                },
+                "tif_clobber": {
+                    "type": "boolean",
+                    "description": "Overwrite existing output files",
+                },
+            },
+            "required": ["tif_file"],
         },
     },
     {
@@ -668,6 +741,59 @@ def execute_tool(name: str, input: dict) -> str:
         if input.get("out_dir"):
             args += ["--out-dir", str(Path(input["out_dir"]).expanduser())]
         return json.dumps(_run_geo(args))
+
+    if name == "run_package":
+        tif_file = str(Path(input["tif_file"]).expanduser())
+        args = [str(GEO_DIR / "packager" / "package.py"), "--tif-file", tif_file]
+        # Default output to deliverables/ in the input file's parent dir
+        output_dir = input.get("output_dir")
+        if not output_dir:
+            output_dir = str(Path(tif_file).parent.parent / "deliverables")
+        args += ["--output-dir", str(Path(output_dir).expanduser())]
+        # Default to COG output unless explicitly asked for tiles or single TIF
+        if input.get("no_tile"):
+            args.append("--no-tile")
+        elif input.get("web_optimized", True):
+            args.append("--web-optimized")
+        if input.get("contour_file"):
+            args += ["--contour-file", str(Path(input["contour_file"]).expanduser())]
+        if input.get("tin_file"):
+            args += ["--tin-file", str(Path(input["tin_file"]).expanduser())]
+        if input.get("transform_yaml"):
+            args += ["--transform-yaml", str(Path(input["transform_yaml"]).expanduser())]
+        if input.get("crs"):
+            args += ["--crs", input["crs"]]
+        if input.get("downsize_gsd"):
+            args += ["--downsize-gsd", str(input["downsize_gsd"])]
+        if input.get("tif_clobber"):
+            args.append("--tif-clobber")
+        # Packaging large orthos can be slow (10-20 min for 2 GB)
+        result = _run_geo(args, timeout=3600)
+
+        # Rename output to customer-friendly names and copy RMSE report
+        if result["status"] == "success":
+            out_path = Path(output_dir).expanduser()
+            renamed = []
+            # Find the generated TIF and rename to orthophoto.tif
+            for f in out_path.iterdir():
+                if f.suffix.lower() in (".tif", ".tiff") and f.name != "orthophoto.tif":
+                    dest = out_path / "orthophoto.tif"
+                    f.rename(dest)
+                    renamed.append(f"{f.name} → orthophoto.tif")
+                    break
+            # Copy RMSE report as accuracy.html
+            job_dir = Path(tif_file).parent.parent
+            for candidate in [job_dir / "rmse.html", job_dir / "rmse-recon.html"]:
+                if candidate.exists():
+                    import shutil
+                    shutil.copy2(str(candidate), str(out_path / "accuracy.html"))
+                    renamed.append(f"{candidate.name} → accuracy.html")
+                    break
+            if renamed:
+                result["deliverables"] = renamed
+                result["deliverables_dir"] = str(out_path)
+
+        return json.dumps(result)
 
     if name == "run_rmse":
         job_dir = Path(input["job_dir"]).expanduser()
@@ -1137,7 +1263,7 @@ def run_agent():
             for call in tool_calls:
                 print(f"\n  [{call.name}] {json.dumps(call.input, indent=2)}")
                 result = execute_tool(call.name, call.input)
-                print(f"  -> {result[:120]}...")
+                print(f"  -> {result[:DISPLAY_LIMIT]}{'...' if len(result) > DISPLAY_LIMIT else ''}")
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": call.id,
