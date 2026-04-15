@@ -83,9 +83,20 @@ that preceding stages are complete.
   SURVEY_LOADED    Emlid field-survey CSV loaded (coordinates + CRS)
   IMAGES_LOADED    Drone images directory identified
   SIGHT_DONE       sight.py — match targets to images → {job}.txt
-  TAGGED           Surveyor tags GCPs/CHKs in GCPEditorPro (human step)
-  SPLIT_DONE       transform.py split → gcp_list.txt + chk_list.txt
-  ODM_RUNNING      ODM processing on EC2
+  TAGGED           Surveyor tags in GCPEditorPro. Track what's tagged
+                   via metadata: gcps_tagged, chks_tagged (both boolean).
+                   Typical workflow:
+                   1. Tag GCPs → split → launch ODM
+                   2. Tag CHKs concurrently while ODM runs
+                   3. Split again (CHKs now included) → RMSE
+                   The agent should suggest this concurrent workflow:
+                   "GCPs are tagged — want to launch ODM now and tag
+                   CHKs while it runs?"
+  SPLIT_DONE       transform.py split → gcp_list.txt + chk_list.txt.
+                   May run twice: once pre-ODM (GCPs only) and once
+                   pre-RMSE (GCPs + CHKs). Second split is safe — GCP
+                   tags don't change between runs.
+  ODM_RUNNING      ODM processing on EC2 (can overlap with CHK tagging)
   ODM_COMPLETE     Results downloaded from S3
   RMSE_RECON       rmse.py step 6a — reconstruction accuracy check.
                    Triangulates GCP/CHK from camera rays, compares to
@@ -184,13 +195,15 @@ When the user says "resume" or opens a job that has state, ALWAYS:
    | File exists | Means | Next step |
    |---|---|---|
    | `{job}_tagged.txt` | Tagging done | Split |
-   | `gcp_list.txt` + `chk_list.txt` | Split done | ODM or RMSE |
+   | `gcp_list.txt` with observations | GCPs tagged + split | ODM |
+   | `chk_list.txt` with observations | CHKs tagged + split | RMSE |
+   | `chk_list.txt` empty (header only) | CHKs NOT tagged yet | Tag CHKs |
    | `reconstruction.topocentric.json` | ODM complete | RMSE 6a |
    | `rmse-recon.html` | RMSE 6a done | Ortho tagging for 6b |
    | `*_tagged.txt` in ortho dir | Ortho tagging done | RMSE 6b |
    | `rmse.html` | RMSE 6b done | QGIS review / package |
 
-   CRITICAL — files on disk override ALL other evidence:
+   CRITICAL — verify file CONTENTS, not just existence:
    - No `rmse*.html` on disk → RMSE is NOT complete. Period. Even if
      the state file says RMSE_DONE, even if metadata contains RMSE
      numbers, even if a prior session summary says it was done. The
@@ -202,6 +215,12 @@ When the user says "resume" or opens a job that has state, ALWAYS:
      tagged version is always the one to use for the next step.
    - NEVER rationalize missing files ("they may not have been persisted").
      If a completion marker file is missing, the step is not done.
+   - A file existing does NOT mean it has useful content. Always check
+     line counts for gcp_list.txt, chk_list.txt, and tagged files.
+     A file with only a header line (1 line) is effectively empty.
+   - When reporting status, distinguish GCP and CHK tagging separately:
+     "GCPs tagged (3 targets, 21 obs) — ready for ODM.
+      CHKs not yet tagged — tag while ODM runs."
 
 4. Propose the NEXT step based on what's actually present, not just the
    recorded state. Example: "State says SPLIT_DONE, and I see
