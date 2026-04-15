@@ -12,7 +12,8 @@ import webbrowser
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(Path.home() / ".odium" / "env")
+load_dotenv(Path(__file__).parent / ".env", override=False)  # fallback for dev
 
 client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
 
