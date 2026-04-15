@@ -124,6 +124,65 @@ history. If the conversation is lost, you can resume from state.
 The state file should be portable: a job can be synced to S3 and resumed
 on a different machine.
 
+IMPORTANT: The state file is a HINT, not ground truth. The user may have
+deleted files, re-run steps externally, or moved things around. Always
+verify state claims by checking whether the expected output files
+actually exist on disk. If the state file says a step is done but the
+output files are missing, the step is NOT done — trust the filesystem.
+
+# Resuming a job
+When the user says "resume" or opens a job that has state, ALWAYS:
+1. Read the state file to see the last recorded stage AND the
+   last_session_summary (if present). The summary is a hint from the
+   prior session about what was done and what's next — treat it as
+   context to verify, not as truth. Mention it briefly: "Last session
+   noted: {summary snippet}. Let me verify..."
+2. List the job directory to see what files actually exist
+3. Compare: the files may be AHEAD of the recorded state (e.g. the user
+   tagged externally, or ran tools outside of odium). Check these
+   completion markers — be precise about what each implies:
+
+   | File exists | Means | Next step |
+   |---|---|---|
+   | `{job}_tagged.txt` | Tagging done | Split |
+   | `gcp_list.txt` + `chk_list.txt` | Split done | ODM or RMSE |
+   | `reconstruction.topocentric.json` | ODM complete | RMSE 6a |
+   | `rmse-recon.html` | RMSE 6a done | Ortho tagging for 6b |
+   | `*_tagged.txt` in ortho dir | Ortho tagging done | RMSE 6b |
+   | `rmse.html` | RMSE 6b done | QGIS review / package |
+
+   CRITICAL — files on disk override ALL other evidence:
+   - No `rmse*.html` on disk → RMSE is NOT complete. Period. Even if
+     the state file says RMSE_DONE, even if metadata contains RMSE
+     numbers, even if a prior session summary says it was done. The
+     HTML report file is the ONLY proof that RMSE completed. If it's
+     missing, RMSE must be (re-)run.
+   - Ortho crops directory ALONE does NOT mean RMSE is complete.
+     Crops are just the INPUT for ortho tagging.
+   - A tagged file and its untagged counterpart may both exist — the
+     tagged version is always the one to use for the next step.
+   - NEVER rationalize missing files ("they may not have been persisted").
+     If a completion marker file is missing, the step is not done.
+
+4. Propose the NEXT step based on what's actually present, not just the
+   recorded state. Example: "State says SPLIT_DONE, and I see
+   reconstruction.topocentric.json is present but no rmse*.html — ready
+   to run RMSE 6a?"
+5. Confirm with the user before proceeding.
+
+NEVER redo work that already has output files unless the user explicitly
+asks to redo it.
+
+# Session memory
+When the session ends, you will be asked to save a session summary via
+save_session_summary. Include: what was accomplished, key facts learned
+(CRS, EPSG, target count, important filenames, issues encountered),
+and what the recommended next step is. Keep it concise (~200 words).
+
+On resume, the summary from the prior session will be in the state file
+as `last_session_summary`. This is a HINT — verify it against actual
+files before acting on it. Mention it briefly to orient the user.
+
 # Tools
 You have tools for each pipeline stage. Some are stubs during development
 — that's fine, work with what you get back. When a tool returns a stub
@@ -132,65 +191,57 @@ result, acknowledge it naturally and continue the flow.
 CRS, EPSG codes, file paths, and other job-specific values come from the
 data and from transform.yaml — never assume a particular EPSG or path.
 
-# File naming conventions (strict — do not deviate without explicit user request)
+# File naming conventions
+These are the STANDARD names produced by the pipeline tools. When running
+pipeline steps yourself, always use these names for outputs.
 
-## Customer inputs
-- Trimble data collector: `{customer}_{job}.dc` or `{job}.dc`
-- Emlid field survey: `{job}_emlid_6529.csv` (or raw Emlid export CSV)
-- Control sheet: `CONTROL SHEET.pdf` (often scanned, needs OCR)
-- Drone images: `images/*.JPG`
+## Standard names (what the tools produce)
+- `{customer}_{job}.dc` or `{job}.dc` — Trimble data collector input
+- `{job}_{epsg}.csv` — survey coords in field CRS (from transform.py dc)
+- `{job}_design.csv` — design-grid coords (from transform.py dc)
+- `transform.yaml` — CRS + shift params (from transform.py dc)
+- `{job}.txt` — untagged tagging file (from sight.py)
+- `{job}_tagged.txt` — tagged file (from GCPEditorPro Download)
+- `gcp_list.txt` / `chk_list.txt` — split files (from transform.py split)
+- `{job}_targets.csv` / `{job}_targets_design.csv` — target summaries
+- `opensfm/reconstruction.topocentric.json` — ODM bundle adjustment
+- `odm_orthophoto/odm_orthophoto.original.tif` — ODM orthophoto
+- `cameras.json` — calibrated camera models
+- `rmse-recon.html` / `rmse.html` — accuracy reports
+- `odm_orthophoto/{ortho_stem}.txt` — ortho tagging file (from rmse.py 6a)
+- `odm_orthophoto/{ortho_stem}-crops/` — ortho crop images
+- `odm_orthophoto/{ortho_stem}_tagged.txt` — tagged ortho (from GCPEditorPro)
 
-## transform.py dc outputs
-- `{job}_{epsg}.csv`     — survey coords in field CRS (e.g. {job}_6529.csv)
-- `{job}_design.csv`     — design-grid coords (customer's coordinate system)
-- `transform.yaml`       — CRS + shift params; auto-loaded by downstream tools
+## Handling non-standard files
+Users may arrive with files that don't follow these conventions — they may
+have done part of the process externally, used different tools, or have
+their own naming scheme. NEVER refuse to work with non-standard filenames.
 
-## sight.py outputs
-- `{job}.txt`            — tagging file for GCPEditorPro (all targets, untagged)
-- `marks_design.csv`     — Pix4D parallel workflow (design-grid coords)
+When you encounter unfamiliar files:
+1. **List the directory** to see what's available
+2. **Infer by extension and content**: .dc → data collector, .csv → could
+   be survey or design coords, .tif/.tiff → likely orthophoto, .txt with
+   tab-separated coords → likely GCP/tagging file, .pdf → control sheet
+3. **Read a few lines** of ambiguous files to identify their purpose:
+   - First line starts with "EPSG:" → GCP/CHK point file
+   - Tab-separated with px/py columns → tagging file
+   - Has "tagged" in 8th column → already tagged
+   - Comma-separated with easting/northing → survey CSV
+4. **Ask the user to confirm** your inference: "I see `control_pts.csv`
+   — this looks like a survey CSV with 42 points in EPSG:6529. Is that
+   your field survey data?"
+5. **If you can't infer**, show the user a list: "I found these files
+   but I'm not sure which is which — can you tell me what each one is?"
+   Then list the files with sizes and your best guesses.
 
-## GCPEditorPro (tagging)
-- Input:  `{job}.txt`
-- Output: `{job}_tagged.txt` (Download button adds _tagged suffix; never overwrites input)
-- IMPORTANT: when user says "I tagged" or "done tagging", always look for
-  `{job}_tagged.txt`, NEVER use the untagged `{job}.txt` for split.
-  If the _tagged file doesn't exist, ask — don't silently use the wrong file.
+The key rule: **when filenames don't match conventions, look at the content
+to figure out what you have**, then confirm with the user before proceeding.
 
-## transform.py split outputs
-- `gcp_list.txt`              — GCP-tagged observations only (for ODM)
-- `chk_list.txt`              — CHK-tagged observations only (for rmse.py)
-- `{job}_targets.csv`         — one row per target, ODM CRS (EPSG:32613)
-- `{job}_targets_design.csv`  — one row per target, design-grid coords
-
-## S3 / EC2 layout
-- `s3://{bucket}/{project}/images/`        — drone images
-- `s3://{bucket}/{project}/gcp_list.txt`   — control file for ODM
-- `{project}` is typically `{client}/{job}`
-
-## ODM outputs (synced from S3)
-- `opensfm/reconstruction.topocentric.json` — bundle adjustment result
-- `odm_orthophoto/odm_orthophoto.original.tif` — orthophoto
-- `odm_report/`                             — ODM processing report
-- `cameras.json`                            — calibrated camera models
-
-## rmse.py step 6a (reconstruction accuracy) outputs
-- `rmse-recon.html`                                    — accuracy report
-- `odm_orthophoto/odm_orthophoto.original.txt`         — ortho tagging file
-- `odm_orthophoto/odm_orthophoto.original-crops/`      — one JPEG per target
-
-## GCPEditorPro (ortho tagging, step 6b)
-- Input:  `odm_orthophoto/odm_orthophoto.original.txt` + crops folder
-- Output: `odm_orthophoto/odm_orthophoto.original_tagged.txt`
-
-## rmse.py step 6b (orthophoto accuracy) outputs
-- `rmse.html`  — full report with both reconstruction + orthophoto accuracy
-
-## packager outputs
-- Deliverables in design-grid CRS (reprojected + shifted via transform.yaml)
-
-## Sanity checks
-- 0 tagged observations after split → almost certainly used wrong file (untagged)
-- 0 GCP or 0 CHK after split → user may not have assigned roles in GCPEditorPro
+## Tagging safety checks
+- When user says "I tagged" or "done tagging", look for `{job}_tagged.txt`
+  or any file with `_tagged` suffix. If not found, list .txt files and ask.
+- 0 tagged observations after split → almost certainly used wrong file
+- 0 GCP or 0 CHK after split → user may not have assigned roles
 - Flag these immediately rather than rationalizing empty results.
 """
 
@@ -401,6 +452,30 @@ TOOLS = [
                 },
             },
             "required": ["path_or_url"],
+        },
+    },
+    {
+        "name": "save_session_summary",
+        "description": "Save a concise summary of this session to the job state file. "
+                       "Call this before the session ends (user says quit/done/bye). "
+                       "The summary will be loaded as context in the next session. "
+                       "Include: what was accomplished, key facts learned (CRS, target "
+                       "count, filenames, issues encountered), and what the next step is.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_dir": {
+                    "type": "string",
+                    "description": "Job directory",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Concise session summary (max ~500 words). Include: "
+                                   "what was done, key facts (CRS, EPSG, target count, "
+                                   "filenames, issues), and recommended next step.",
+                },
+            },
+            "required": ["job_dir", "summary"],
         },
     },
     {
@@ -733,6 +808,25 @@ def execute_tool(name: str, input: dict) -> str:
         except Exception as e:
             return json.dumps({"error": f"Could not write state: {e}"})
 
+    if name == "save_session_summary":
+        job_dir = Path(input["job_dir"]).expanduser()
+        state_file = job_dir / ".odium-state.json"
+        if state_file.exists():
+            try:
+                state = json.loads(state_file.read_text())
+            except Exception:
+                state = {}
+        else:
+            state = {}
+        from datetime import datetime, timezone
+        state["last_session_summary"] = input["summary"]
+        state["last_session_timestamp"] = datetime.now(timezone.utc).isoformat()
+        try:
+            state_file.write_text(json.dumps(state, indent=2) + "\n")
+            return json.dumps({"status": "success"})
+        except Exception as e:
+            return json.dumps({"error": f"Could not write state: {e}"})
+
     if name == "open_in_browser":
         target = input["path_or_url"]
         if target.startswith(("http://", "https://")):
@@ -947,12 +1041,52 @@ def run_agent():
         try:
             user_input = input("you> ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nbye")
+            # Try to save summary on interrupt too
+            if messages:
+                print("\n  [saving session summary...]")
+                try:
+                    messages.append({"role": "user", "content":
+                        "Session interrupted. Call save_session_summary with "
+                        "a brief summary of what was done and next steps."})
+                    response = client.messages.create(
+                        model=MODEL, max_tokens=512,
+                        system=SYSTEM_PROMPT, tools=TOOLS,
+                        messages=messages,
+                    )
+                    for block in response.content:
+                        if block.type == "tool_use":
+                            execute_tool(block.name, block.input)
+                except Exception:
+                    pass
+            print("bye")
             break
 
         if not user_input:
             continue
         if user_input.lower() in ("quit", "exit", "q"):
+            # Ask the agent to save a session summary before exiting
+            if messages:
+                messages.append({"role": "user", "content":
+                    "The session is ending. If you worked on a job this session, "
+                    "please call save_session_summary now with a concise summary "
+                    "of what was done and what the next step should be. "
+                    "If no job was worked on, just say goodbye."})
+                # Run one more agent turn to let it save
+                try:
+                    response = client.messages.create(
+                        model=MODEL, max_tokens=1024,
+                        system=SYSTEM_PROMPT, tools=TOOLS,
+                        messages=messages,
+                    )
+                    # Execute any tool calls (should be save_session_summary)
+                    for block in response.content:
+                        if block.type == "tool_use":
+                            print(f"\n  [{block.name}] saving session summary...")
+                            execute_tool(block.name, block.input)
+                        elif hasattr(block, "text"):
+                            print(f"\nodium> {block.text}")
+                except Exception:
+                    pass  # don't block exit on errors
             print("bye")
             break
 
