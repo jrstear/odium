@@ -464,6 +464,130 @@ TOOLS = [
         },
     },
     {
+        "name": "s3_upload",
+        "description": "Upload job data to S3 for ODM processing. Syncs images/ and "
+                       "gcp_list.txt to s3://{bucket}/{client}/{job}/. Confirms cost "
+                       "implications before proceeding. Large uploads (>10 GB) may "
+                       "take 10-30 minutes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_dir": {
+                    "type": "string",
+                    "description": "Local job directory containing images/ and gcp_list.txt",
+                },
+                "s3_prefix": {
+                    "type": "string",
+                    "description": "S3 path prefix (e.g. 'bsn/ghostrider2'). "
+                                   "Data goes to s3://{bucket}/{s3_prefix}/",
+                },
+                "bucket": {
+                    "type": "string",
+                    "description": "S3 bucket name (default: stratus-jrstear)",
+                },
+            },
+            "required": ["job_dir", "s3_prefix"],
+        },
+    },
+    {
+        "name": "ec2_launch",
+        "description": "Launch an EC2 instance for ODM processing via terraform apply. "
+                       "Requires S3 data already uploaded. Creates SNS topic for "
+                       "notifications. Exports Grafana vars from ~/.odium/env if present. "
+                       "ALWAYS confirm cost estimate and email before launching.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "s3_prefix": {
+                    "type": "string",
+                    "description": "S3 path prefix matching the upload (e.g. 'bsn/ghostrider2')",
+                },
+                "notify_email": {
+                    "type": "string",
+                    "description": "Email for status notifications (required unless user opts out)",
+                },
+                "instance_type": {
+                    "type": "string",
+                    "description": "EC2 instance type (default: r5.4xlarge). "
+                                   "r5.4xlarge=16cpu/128GB, r5.8xlarge=32cpu/256GB, m5.4xlarge=16cpu/64GB",
+                },
+                "ebs_size_gb": {
+                    "type": "integer",
+                    "description": "EBS volume size in GB (default: 500). Scale with image count.",
+                },
+                "use_spot": {
+                    "type": "boolean",
+                    "description": "Use spot instances (default: false — on-demand is more reliable)",
+                },
+            },
+            "required": ["s3_prefix"],
+        },
+    },
+    {
+        "name": "ec2_status",
+        "description": "Check the status of the running ODM instance. Reads the "
+                       "bootstrap log via SSH to determine current pipeline stage, "
+                       "elapsed time, and any errors.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "ec2_ssh",
+        "description": "Run a command on the EC2 instance via SSH. Useful for "
+                       "checking logs, disk space, docker status, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Command to run on the instance",
+                },
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "s3_download",
+        "description": "Download ODM results from S3. Only downloads what's needed "
+                       "for RMSE + packaging (not everything): reconstruction, "
+                       "orthophoto, cameras.json. Specify additional paths to include.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_dir": {
+                    "type": "string",
+                    "description": "Local job directory to download into",
+                },
+                "s3_prefix": {
+                    "type": "string",
+                    "description": "S3 path prefix (e.g. 'bsn/ghostrider2')",
+                },
+                "bucket": {
+                    "type": "string",
+                    "description": "S3 bucket name (default: stratus-jrstear)",
+                },
+                "extra_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Additional S3 subdirs to download (e.g. ['odm_dem', 'odm_report'])",
+                },
+            },
+            "required": ["job_dir", "s3_prefix"],
+        },
+    },
+    {
+        "name": "ec2_destroy",
+        "description": "Tear down the EC2 instance via terraform destroy. Cancels "
+                       "spot request, deletes EBS volume, cleans up security group. "
+                       "S3 data is preserved. ALWAYS confirm before destroying.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
         "name": "run_rmse",
         "description": "Run rmse.py for accuracy assessment. Auto-detects files in "
                        "the job directory: reconstruction.topocentric.json (if present), "
@@ -924,6 +1048,266 @@ def execute_tool(name: str, input: dict) -> str:
                 result["deliverables_dir"] = str(out_path)
 
         return json.dumps(result)
+
+    if name == "s3_upload":
+        job_dir = Path(input["job_dir"]).expanduser()
+        bucket = input.get("bucket", "stratus-jrstear")
+        s3_prefix = input["s3_prefix"]
+        s3_base = f"s3://{bucket}/{s3_prefix}"
+        results = {}
+        profile = os.environ.get("AWS_PROFILE", "default")
+        aws_base = ["aws", "s3"]
+        if profile != "default":
+            aws_base = ["aws", "--profile", profile, "s3"]
+
+        # Sync images
+        images_dir = job_dir / "images"
+        if not images_dir.exists():
+            return json.dumps({"error": f"No images/ directory in {job_dir}"})
+        img_count = len(list(images_dir.glob("*.JPG")) + list(images_dir.glob("*.jpg")))
+        try:
+            proc = subprocess.run(
+                aws_base + ["sync", str(images_dir), f"{s3_base}/images/",
+                            "--exclude", "*.MRK", "--exclude", "*.nav",
+                            "--exclude", "*.obs", "--exclude", "*.bin"],
+                capture_output=True, text=True, timeout=1800,
+            )
+            results["images"] = {
+                "status": "success" if proc.returncode == 0 else "error",
+                "count": img_count,
+                "stdout": _truncate(proc.stdout),
+                "stderr": _truncate(proc.stderr, 1000),
+            }
+        except subprocess.TimeoutExpired:
+            results["images"] = {"status": "error", "error": "Upload timed out (30 min)"}
+
+        # Upload gcp_list.txt
+        gcp_file = job_dir / "gcp_list.txt"
+        if gcp_file.exists():
+            try:
+                proc = subprocess.run(
+                    aws_base + ["cp", str(gcp_file), f"{s3_base}/gcp_list.txt"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                results["gcp_list"] = {
+                    "status": "success" if proc.returncode == 0 else "error",
+                }
+            except Exception as e:
+                results["gcp_list"] = {"status": "error", "error": str(e)}
+        else:
+            results["gcp_list"] = {"status": "skipped", "reason": "gcp_list.txt not found"}
+
+        results["s3_base"] = s3_base
+        return json.dumps(results)
+
+    if name == "ec2_launch":
+        s3_prefix = input["s3_prefix"]
+        tf_dir = GEO_DIR / "infra" / "ec2"
+        if not tf_dir.exists():
+            return json.dumps({"error": f"Terraform dir not found: {tf_dir}"})
+
+        # Build terraform args
+        tf_vars = ["-var", f"project={s3_prefix}"]  # terraform still uses 'project' (geo-q77a)
+
+        notify_email = input.get("notify_email") or os.environ.get("ODM_NOTIFY_EMAIL", "")
+        if notify_email:
+            tf_vars += ["-var", f"notify_email={notify_email}"]
+
+        if input.get("instance_type"):
+            tf_vars += ["-var", f"instance_type={input['instance_type']}"]
+        if input.get("ebs_size_gb"):
+            tf_vars += ["-var", f"ebs_size_gb={input['ebs_size_gb']}"]
+        if input.get("use_spot"):
+            tf_vars += ["-var", "use_spot=true"]
+
+        # Export Grafana TF_VARs from env
+        env = os.environ.copy()
+        grafana_map = {
+            "GRAFANA_API_KEY": "TF_VAR_grafana_api_key",
+            "GRAFANA_SA_KEY": "TF_VAR_grafana_sa_key",
+            "GRAFANA_STACK_URL": "TF_VAR_grafana_stack_url",
+            "GRAFANA_PROM_URL": "TF_VAR_grafana_prom_url",
+            "GRAFANA_PROM_USER": "TF_VAR_grafana_prom_user",
+            "GRAFANA_LOKI_URL": "TF_VAR_grafana_loki_url",
+            "GRAFANA_LOKI_USER": "TF_VAR_grafana_loki_user",
+        }
+        for env_key, tf_key in grafana_map.items():
+            val = os.environ.get(env_key, "")
+            if val:
+                env[tf_key] = val
+
+        try:
+            proc = subprocess.run(
+                ["terraform", "apply", "-auto-approve"] + tf_vars,
+                cwd=str(tf_dir), env=env,
+                capture_output=True, text=True, timeout=300,
+            )
+            result = {
+                "status": "success" if proc.returncode == 0 else "error",
+                "stdout": _truncate(proc.stdout),
+                "stderr": _truncate(proc.stderr, 2000),
+            }
+            # Extract outputs if successful
+            if proc.returncode == 0:
+                for output_name in ["public_ip", "sns_topic_arn"]:
+                    out = subprocess.run(
+                        ["terraform", "output", "-raw", output_name],
+                        cwd=str(tf_dir), capture_output=True, text=True, timeout=10,
+                    )
+                    if out.returncode == 0:
+                        result[output_name] = out.stdout.strip()
+
+                # Save SSH key if it doesn't exist yet
+                ssh_key_path = Path(os.environ.get("ODM_SSH_KEY",
+                                   "~/.ssh/geo-odm-ec2.pem")).expanduser()
+                if not ssh_key_path.exists():
+                    key_out = subprocess.run(
+                        ["terraform", "output", "-raw", "private_key_pem"],
+                        cwd=str(tf_dir), capture_output=True, text=True, timeout=10,
+                    )
+                    if key_out.returncode == 0 and key_out.stdout.strip():
+                        ssh_key_path.parent.mkdir(parents=True, exist_ok=True)
+                        ssh_key_path.write_text(key_out.stdout)
+                        ssh_key_path.chmod(0o600)
+                        result["ssh_key_saved"] = str(ssh_key_path)
+
+            return json.dumps(result)
+        except subprocess.TimeoutExpired:
+            return json.dumps({"status": "error", "error": "terraform apply timed out (5 min)"})
+        except Exception as e:
+            return json.dumps({"status": "error", "error": str(e)})
+
+    if name == "ec2_status":
+        tf_dir = GEO_DIR / "infra" / "ec2"
+        ssh_key = Path(os.environ.get("ODM_SSH_KEY",
+                       "~/.ssh/geo-odm-ec2.pem")).expanduser()
+
+        # Get IP from terraform
+        try:
+            ip_out = subprocess.run(
+                ["terraform", "output", "-raw", "public_ip"],
+                cwd=str(tf_dir), capture_output=True, text=True, timeout=10,
+            )
+            if ip_out.returncode != 0 or not ip_out.stdout.strip():
+                return json.dumps({"status": "no_instance", "note": "No active EC2 instance (terraform has no state)"})
+            ip = ip_out.stdout.strip()
+        except Exception as e:
+            return json.dumps({"error": f"Could not get instance IP: {e}"})
+
+        # SSH in and get status
+        ssh_cmd = ["ssh", "-i", str(ssh_key), "-o", "StrictHostKeyChecking=no",
+                   "-o", "ConnectTimeout=5", f"ec2-user@{ip}",
+                   "tail -50 /var/log/odm-bootstrap.log 2>/dev/null; "
+                   "echo '---DOCKER---'; sudo docker ps --format '{{.Status}}' 2>/dev/null; "
+                   "echo '---DISK---'; df -h /data 2>/dev/null | tail -1"]
+        try:
+            proc = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=15)
+            return json.dumps({
+                "status": "success",
+                "ip": ip,
+                "log_tail": _truncate(proc.stdout, 3000),
+                "stderr": _truncate(proc.stderr, 500) if proc.stderr else "",
+            })
+        except subprocess.TimeoutExpired:
+            return json.dumps({"status": "unreachable", "ip": ip, "note": "SSH timed out — instance may be starting up"})
+        except Exception as e:
+            return json.dumps({"error": f"SSH failed: {e}", "ip": ip})
+
+    if name == "ec2_ssh":
+        tf_dir = GEO_DIR / "infra" / "ec2"
+        ssh_key = Path(os.environ.get("ODM_SSH_KEY",
+                       "~/.ssh/geo-odm-ec2.pem")).expanduser()
+        try:
+            ip_out = subprocess.run(
+                ["terraform", "output", "-raw", "public_ip"],
+                cwd=str(tf_dir), capture_output=True, text=True, timeout=10,
+            )
+            if ip_out.returncode != 0:
+                return json.dumps({"error": "No active EC2 instance"})
+            ip = ip_out.stdout.strip()
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+        ssh_cmd = ["ssh", "-i", str(ssh_key), "-o", "StrictHostKeyChecking=no",
+                   "-o", "ConnectTimeout=10", f"ec2-user@{ip}",
+                   input["command"]]
+        try:
+            proc = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=60)
+            return json.dumps({
+                "status": "success",
+                "stdout": _truncate(proc.stdout),
+                "stderr": _truncate(proc.stderr, 1000),
+                "returncode": proc.returncode,
+            })
+        except subprocess.TimeoutExpired:
+            return json.dumps({"error": "Command timed out (60s)"})
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    if name == "s3_download":
+        job_dir = Path(input["job_dir"]).expanduser()
+        bucket = input.get("bucket", "stratus-jrstear")
+        s3_prefix = input["s3_prefix"]
+        s3_base = f"s3://{bucket}/{s3_prefix}"
+        profile = os.environ.get("AWS_PROFILE", "default")
+        aws_base = ["aws", "s3"]
+        if profile != "default":
+            aws_base = ["aws", "--profile", profile, "s3"]
+
+        # Default: only what's needed for RMSE + packaging
+        downloads = [
+            ("opensfm/reconstruction.topocentric.json", "opensfm/"),
+            ("odm_orthophoto/", "odm_orthophoto/"),
+            ("cameras.json", "."),
+        ]
+        # Add extra paths if requested
+        for extra in input.get("extra_paths", []):
+            downloads.append((extra + "/", extra + "/"))
+
+        results = {}
+        for s3_path, local_path in downloads:
+            local_dest = job_dir / local_path
+            local_dest.mkdir(parents=True, exist_ok=True)
+            s3_src = f"{s3_base}/{s3_path}"
+
+            # Use cp for single files, sync for directories
+            if s3_path.endswith("/"):
+                cmd = aws_base + ["sync", s3_src, str(local_dest)]
+            else:
+                cmd = aws_base + ["cp", s3_src, str(local_dest)]
+
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=600,
+                )
+                results[s3_path] = {
+                    "status": "success" if proc.returncode == 0 else "error",
+                    "stderr": proc.stderr.strip()[:200] if proc.returncode != 0 else "",
+                }
+            except subprocess.TimeoutExpired:
+                results[s3_path] = {"status": "error", "error": "timeout"}
+            except Exception as e:
+                results[s3_path] = {"status": "error", "error": str(e)}
+
+        return json.dumps({"s3_base": s3_base, "downloads": results})
+
+    if name == "ec2_destroy":
+        tf_dir = GEO_DIR / "infra" / "ec2"
+        try:
+            proc = subprocess.run(
+                ["terraform", "destroy", "-auto-approve"],
+                cwd=str(tf_dir),
+                capture_output=True, text=True, timeout=300,
+            )
+            return json.dumps({
+                "status": "success" if proc.returncode == 0 else "error",
+                "stdout": _truncate(proc.stdout),
+                "stderr": _truncate(proc.stderr, 2000),
+            })
+        except subprocess.TimeoutExpired:
+            return json.dumps({"error": "terraform destroy timed out (5 min)"})
+        except Exception as e:
+            return json.dumps({"error": str(e)})
 
     if name == "run_rmse":
         job_dir = Path(input["job_dir"]).expanduser()
