@@ -97,8 +97,75 @@ that preceding stages are complete.
                    May run twice: once pre-ODM (GCPs only) and once
                    pre-RMSE (GCPs + CHKs). Second split is safe — GCP
                    tags don't change between runs.
-  ODM_RUNNING      ODM processing on EC2 (can overlap with CHK tagging)
+  ODM_RUNNING      ODM processing on EC2 (can overlap with CHK tagging).
+                   Present upload + launch as ONE confirmation to the user:
+                   "Ready to launch ODM: 126 images (1.7 GB upload ~2 min),
+                   r5.4xlarge ~$5-8 estimated. Proceed?"
+                   Then run s3_upload → ec2_launch → update state, narrating
+                   each step. Don't ask for separate confirmations unless
+                   the user specifically asks to split the steps (e.g.
+                   "just upload for now" or "I already uploaded").
   ODM_COMPLETE     Results downloaded from S3
+
+# Monitoring an ODM run (ec2_status / ec2_ssh)
+When checking ODM status, look for these patterns in the bootstrap log
+(/var/log/odm-bootstrap.log):
+
+## Pipeline phases (odm-bootstrap.sh)
+  "odm-bootstrap starting"         → instance just booted
+  "Waiting for Docker..."           → docker daemon starting
+  "Waiting for ODM image pull..."   → downloading ODM docker image
+  "Patching exifread..."            → applying DJI bug fix
+  phase 3 "syncing"                 → syncing data from S3
+
+## ODM stages (odm-run.sh) — in order:
+  dataset → opensfm → openmvs → odm_filterpoints → odm_meshing →
+  mvs_texturing → odm_georeferencing → odm_dem → odm_orthophoto → odm_report
+
+  "▶ {stage}  [threads=N]"          → stage starting
+  "✓ {stage} complete"              → stage finished successfully
+  "✓ {stage} (complete, skipping)"  → stage already done (resume)
+  "✗ {stage} FAILED (exit N)"       → stage failed
+  "✗ {stage} hung — CPU idle Nmin"  → killed for inactivity
+  "✗ {stage} killed by 12h timeout" → absolute stage timeout
+
+## Completion / failure
+  "═══ All stages complete ═══"     → pipeline done, syncing results to S3
+  ".odm-complete marker"            → fully done, instance shutting down
+  ".odm-failed marker"              → failed, shutting down in 15 min
+
+## Spot interruption
+  "spot interruption" in spot-watcher log → AWS reclaimed the instance
+  Instance will auto-restart (persistent spot) and resume from last stage
+
+## When ODM is complete
+If the user asks for status and the job is done, immediately start
+downloading results (s3_download) without asking — it's non-destructive
+and the user can interrupt (Ctrl-C) or say "stop" if they want the
+data elsewhere. Then proceed to RMSE.
+
+## What to report to the user
+Summarize concisely:
+  "ODM is on stage opensfm (3 of 10). Running 2h12m so far. Disk 45% used."
+  "opensfm just completed. Now on openmvs — this is typically the longest stage."
+  "Pipeline failed on odm_meshing (exit 1). Check docker logs?"
+  "All stages complete — results syncing to S3. Ready to download soon."
+
+## Typical stage durations (250-image job, r5.4xlarge)
+  opensfm: 30-60 min (feature extraction + matching + reconstruction)
+  openmvs: 20-40 min (dense point cloud)
+  odm_orthophoto: 10-20 min
+  Other stages: 2-10 min each
+  Total: 1.5-3 hours
+
+For larger jobs (1000+ images), opensfm can take 4-8 hours.
+
+## Common issues from experience (aztec2-7 runs)
+- opensfm memory exhaustion on m5.4xlarge (64 GB) → use r5.4xlarge (128 GB)
+- exifread DJI MakerNote bug → patched automatically by bootstrap
+- Spot interruption during opensfm → resumes cleanly (reconstruction cached)
+- odm_orthophoto failure with --optimize-disk-space → that flag is excluded
+- Large point clouds filling disk → check df -h /data via ec2_ssh
   RMSE_RECON       rmse.py step 6a — reconstruction accuracy check.
                    Triangulates GCP/CHK from camera rays, compares to
                    survey coords. Also emits ortho crops + tagging file
