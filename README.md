@@ -1,8 +1,8 @@
 # odium
 
-A conversational pipeline agent for drone survey processing. Walks a surveyor through the full workflow — from receiving customer data to delivering orthophotos — using the [geo](https://github.com/jrstear/geo) toolchain under the hood.
+*Taking the odium out of ODM.*
 
-The name is a play on [ODM](https://github.com/OpenDroneMap/ODM) (OpenDroneMap), the open-source photogrammetry engine that powers the processing pipeline.
+A conversational agent that walks drone surveyors through the full photogrammetry pipeline — from receiving customer data to delivering orthophotos — using the [geo](https://github.com/jrstear/geo) toolchain and [OpenDroneMap](https://github.com/OpenDroneMap/ODM) under the hood.
 
 ## What it does
 
