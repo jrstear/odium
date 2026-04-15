@@ -1,7 +1,7 @@
-# geo-agent — design notes
+# odium — design notes
 
-**Bead:** geo-nha8
-**Status:** design / not started
+**Bead:** odium-jha
+**Status:** scaffolding / in progress
 
 ## Goal
 
@@ -78,7 +78,7 @@ worker bees, called as subprocesses.
 
 ## User journey sketch (MVP)
 
-1. The surveyor double-clicks `geo-agent`. A small window opens.
+1. The surveyor double-clicks `odium`. A small window opens.
 2. Agent: "Welcome. New job, or continue an existing one?"
 3. New: asks for job name (e.g. `aztec8`), .dc file path (file picker),
    then confirms before running `transform.py dc`. Shows progress.
@@ -151,7 +151,7 @@ SIGHT_DONE             ─→ {job}.txt (ODM) + marks_design.csv (Pix4D)
                       ARCHIVED
 ```
 
-State persists in `<job_dir>/.geo-agent-state.json` so the surveyor can
+State persists in `<job_dir>/.odium-state.json` so the surveyor can
 close and reopen the agent without losing progress. The state file
 records the platform(s) and the per-platform sub-state.
 
@@ -327,9 +327,9 @@ the Pix4D path goes beyond "stub" in the MVP.
 
 ### 9. Multi-job state file location
 
-- **Per-job state**: lives in the job dir as `.geo-agent-state.json`.
+- **Per-job state**: lives in the job dir as `.odium-state.json`.
   This is the resumption fuel.
-- **Global registry**: a small index in `~/.geo-agent/jobs.json` listing
+- **Global registry**: a small index in `~/.odium/jobs.json` listing
   all known jobs and their statuses. Used for "list my jobs", lifecycle
   management, NAS sync tracking.
 
@@ -428,18 +428,70 @@ Once the MVP is working with a real surveyor:
 - **Total to "a surveyor can run a job themselves"** (ODM-only): ~2 weeks
 - **Total to "surveyor loves it"** (incl. Pix4D + lifecycle): ~6 weeks
 
+## Resolved design decisions (2026-04-14)
+
+### Tone and personality
+Friendly, helpful, knowledgeable. Mostly get-it-done, but narrate actions
+as they happen: "converting from EPSG:6529 to 32613, estimating tag
+positions, ready for you to tag at http://..." — the surveyor should
+always know what's happening and why.
+
+### Agent capability level
+Capable agent, not script-follower. Expected challenge areas where the
+agent needs real smarts:
+- **CRS/design shifts** — transform.py has some logic but probably
+  insufficient for all cases; agent may need to reason about coordinate
+  systems
+- **ODM runs** — historically require significant troubleshooting even
+  on-demand; especially complex when switching instance types per stage
+- **Point cloud issues** — misclassifications, artifacts; agent helps
+  the surveyor get into tools like QGIS (bead geo-7znc), CloudCompare,
+  etc.
+
+### State management
+- Explicit state file per job (`.odium-state.json`)
+- Do NOT gate allowed actions — instead, warn about consequences:
+  "You're at step E. Going back to step B means re-doing B→E, which
+  will cost ~$Y and take ~N hours. Confirm?"
+- State must be resilient: restartable across sessions, portable across
+  machines (state can be synced up/down via S3 to move between computers)
+
+### Confirmation policy
+- **Time**: advise with estimates, don't block. Track historical runtimes
+  (system, image count, elapsed time) so estimates improve with use.
+- **Money**: confirm before spending (EC2 launch, significant rework that
+  re-incurs AWS cost)
+- **Destructive**: confirm before cleanup, archive, overwrites
+- **Rework**: confirm if significant cost or time involved
+
+### Error handling
+- Depends on error type — no blanket policy
+- AWS tooling should be smart enough to shepherd jobs to completion
+  (retry transient failures, handle spot interruptions)
+- Agent should know how to check AWS run status (CloudWatch, SNS,
+  SSH to instance) — same diagnostic patterns used during aztec2–7 runs
+- When expectations are disappointed, agent helps diagnose and recover
+
+### Infrastructure decisions
+- **Repo**: separate repo (`odium`), geo is a runtime dependency
+- **Env**: separate conda env (`odium`), calls geo tools via
+  `conda run -n geo python ...`
+- **GUI**: Flask + browser (MVP), same pattern as packager/app.py
+- **API key**: surveyor signs up for their own (agent walks through setup)
+- **AWS**: each surveyor has their own AWS account; dev/test uses
+  maintainer's account
+- **Pix4D**: deferred to v2 (ODM-only MVP first)
+
 ## Next steps
 
-1. **Validate demand** — does the target surveyor expect to run jobs
-   often enough that this is worth building? (If <5/year, hand-running
-   it for them is fine.)
-2. **Resolve open questions 1–11** above. Question 8 (Pix4D specifics)
-   needs the most investigation.
-3. **Write the system prompt** — this is the hardest design artifact;
-   it encodes the workflow, the personality, the safety rails
-4. **Scaffold the project layout** (`geo-agent/` subdir or separate
-   repo?)
-5. **Build the ODM-only MVP**, then layer in Pix4D once question 8
-   is resolved
-
-Do not start scaffolding until questions 1–11 are settled.
+1. ~~Validate demand~~ — proceeding; secondary goal is Agent SDK learning
+2. ~~Resolve open questions 1–11~~ — key decisions resolved above;
+   Q8 (Pix4D) deferred to v2
+3. ~~Scaffold the project layout~~ — done: `~/git/odium/` separate repo
+4. **Write the system prompt** — encode workflow, personality, safety
+   rails (in progress)
+5. **Get API credits working** — $5 purchased, propagation pending
+6. **Build the agent loop** — terminal-first, stub tools, iterate on
+   the conversational flow
+7. **Add real tool implementations** — wire stubs to actual geo commands
+8. **Add Flask GUI** — presentation layer over the working agent

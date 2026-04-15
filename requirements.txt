@@ -1,0 +1,6 @@
+anthropic
+python-dotenv
+pymupdf
+pytesseract
+Pillow
+requests
