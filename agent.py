@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+import webbrowser
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -61,7 +62,9 @@ that preceding stages are complete.
   RMSE_RECON       rmse.py step 6a — reconstruction accuracy check.
                    Triangulates GCP/CHK from camera rays, compares to
                    survey coords. Also emits ortho crops + tagging file
-                   for step 6b.
+                   for step 6b. REQUIRED before packaging — this is the
+                   quality gate. If no reconstruction is available (e.g.
+                   Pix4D ortho), runs in ortho-only mode with --emit-ortho-tags.
   ORTHO_TAGGED     Surveyor tags target centers in ortho crops (step 6b
                    human step — one crop per target)
   RMSE_ORTHO       rmse.py step 6b — orthophoto accuracy check. Measures
@@ -73,6 +76,7 @@ that preceding stages are complete.
   QGIS_DESIGN      QGIS review in customer design grid coordinates.
                    Verify deliverables match customer expectations.
   PACKAGED         packager.py — reproject + shift to design grid, COG
+                   NEVER skip RMSE to go directly to packaging.
   DELIVERED        Artifacts placed in Google Drive folder, customer
                    emailed.
   ARCHIVED         Local data cleaned up, job record preserved.
@@ -286,6 +290,53 @@ TOOLS = [
         },
     },
     {
+        "name": "run_rmse",
+        "description": "Run rmse.py for accuracy assessment. Auto-detects files in "
+                       "the job directory: reconstruction.topocentric.json (if present), "
+                       "gcp_list.txt, chk_list.txt, orthophoto. If reconstruction is "
+                       "absent, runs in ortho-only mode (requires orthophoto). "
+                       "Step 6a: pass emit_ortho_tags=true to produce ortho crops for tagging. "
+                       "Step 6b: pass ortho_tags path to compute orthophoto accuracy.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_dir": {
+                    "type": "string",
+                    "description": "Job directory (auto-detects files within it)",
+                },
+                "html": {
+                    "type": "string",
+                    "description": "Output HTML report path (default: {job_dir}/rmse.html)",
+                },
+                "emit_ortho_tags": {
+                    "type": "boolean",
+                    "description": "Emit ortho crops + tagging file for step 6b (default false)",
+                },
+                "ortho_tags": {
+                    "type": "string",
+                    "description": "Path to tagged ortho file from GCPEditorPro (step 6b)",
+                },
+                "ortho": {
+                    "type": "string",
+                    "description": "Override orthophoto path (normally auto-detected)",
+                },
+                "reconstruction": {
+                    "type": "string",
+                    "description": "Override reconstruction path (normally auto-detected)",
+                },
+                "gcp": {
+                    "type": "string",
+                    "description": "Override gcp_list.txt path (normally auto-detected)",
+                },
+                "chk": {
+                    "type": "string",
+                    "description": "Override chk_list.txt path (normally auto-detected)",
+                },
+            },
+            "required": ["job_dir"],
+        },
+    },
+    {
         "name": "get_job_state",
         "description": "Read the current state of a job from its state file. "
                        "Returns the current stage, history, and job metadata.",
@@ -335,6 +386,21 @@ TOOLS = [
                 },
             },
             "required": ["job_dir", "stage"],
+        },
+    },
+    {
+        "name": "open_in_browser",
+        "description": "Open a file or URL in the default browser. Use for HTML reports, "
+                       "GCPEditorPro, or any web content the surveyor needs to see.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path_or_url": {
+                    "type": "string",
+                    "description": "File path or URL to open",
+                },
+            },
+            "required": ["path_or_url"],
         },
     },
     {
@@ -500,12 +566,26 @@ def execute_tool(name: str, input: dict) -> str:
             args += ["--n-control", str(input["n_control"])]
         if input.get("crs"):
             args += ["--crs", input["crs"]]
-        if input.get("cameras"):
-            args += ["--cameras", str(Path(input["cameras"]).expanduser())]
+        # Auto-detect cameras.json if not explicitly provided
+        cameras = input.get("cameras")
+        if not cameras:
+            survey_dir = Path(survey_csv).parent
+            for candidate in [
+                survey_dir / "cameras.json",
+                survey_dir / "opensfm" / "cameras.json",
+            ]:
+                if candidate.exists():
+                    cameras = str(candidate)
+                    break
+        if cameras:
+            args += ["--cameras", str(Path(cameras).expanduser())]
         if input.get("nadir_weight") is not None:
             args += ["--nadir-weight", str(input["nadir_weight"])]
         # sight.py can be slow — give it 30 minutes
-        return json.dumps(_run_geo(args, timeout=1800))
+        result = _run_geo(args, timeout=1800)
+        if cameras and "cameras" not in (input or {}):
+            result["auto_cameras"] = cameras
+        return json.dumps(result)
 
     if name == "transform_split":
         tagged_path = str(Path(input["tagged_path"]).expanduser())
@@ -513,6 +593,91 @@ def execute_tool(name: str, input: dict) -> str:
         if input.get("out_dir"):
             args += ["--out-dir", str(Path(input["out_dir"]).expanduser())]
         return json.dumps(_run_geo(args))
+
+    if name == "run_rmse":
+        job_dir = Path(input["job_dir"]).expanduser()
+
+        # Auto-detect reconstruction
+        recon = input.get("reconstruction")
+        if not recon:
+            for candidate in [
+                job_dir / "opensfm" / "reconstruction.topocentric.json",
+            ]:
+                if candidate.exists():
+                    recon = str(candidate)
+                    break
+
+        # Auto-detect gcp/chk
+        gcp = input.get("gcp")
+        if not gcp:
+            c = job_dir / "gcp_list.txt"
+            if c.exists():
+                gcp = str(c)
+        chk = input.get("chk")
+        if not chk:
+            c = job_dir / "chk_list.txt"
+            if c.exists():
+                chk = str(c)
+
+        # Auto-detect orthophoto
+        ortho = input.get("ortho")
+        if not ortho:
+            for candidate in [
+                job_dir / "odm_orthophoto" / "odm_orthophoto.original.tif",
+                job_dir / "odm_orthophoto" / "odm_orthophoto.original_cog.tif",
+                job_dir / "odm_orthophoto" / "odm_orthophoto.tif",
+            ]:
+                if candidate.exists():
+                    ortho = str(candidate)
+                    break
+
+        # Build args
+        args = [str(GEO_DIR / "rmse.py")]
+
+        has_recon = recon is not None
+        if has_recon:
+            args.append(recon)
+
+        if gcp:
+            args += ["--gcp", gcp]
+        if chk:
+            args += ["--chk", chk]
+        if ortho:
+            args += ["--ortho", ortho]
+
+        # HTML report
+        html = input.get("html")
+        if not html:
+            if input.get("emit_ortho_tags") and has_recon:
+                html = str(job_dir / "rmse-recon.html")
+            elif input.get("ortho_tags") or has_recon:
+                html = str(job_dir / "rmse.html")
+        if html:
+            args += ["--html", html]
+
+        if input.get("emit_ortho_tags"):
+            args.append("--emit-ortho-tags")
+        if input.get("ortho_tags"):
+            args += ["--ortho-tags", str(Path(input["ortho_tags"]).expanduser())]
+
+        # Report what was auto-detected
+        detected = {}
+        if recon and "reconstruction" not in input:
+            detected["reconstruction"] = recon
+        if gcp and "gcp" not in input:
+            detected["gcp"] = gcp
+        if chk and "chk" not in input:
+            detected["chk"] = chk
+        if ortho and "ortho" not in input:
+            detected["ortho"] = ortho
+
+        result = _run_geo(args)
+        if detected:
+            result["auto_detected"] = detected
+        result["has_reconstruction"] = has_recon
+        if html:
+            result["html_report"] = html
+        return json.dumps(result)
 
     if name == "get_job_state":
         job_dir = Path(input["job_dir"]).expanduser()
@@ -567,6 +732,18 @@ def execute_tool(name: str, input: dict) -> str:
             return json.dumps({"status": "success", "stage": new_stage, "job_dir": str(job_dir)})
         except Exception as e:
             return json.dumps({"error": f"Could not write state: {e}"})
+
+    if name == "open_in_browser":
+        target = input["path_or_url"]
+        if target.startswith(("http://", "https://")):
+            webbrowser.open(target)
+            return json.dumps({"status": "success", "opened": target})
+        else:
+            path = Path(target).expanduser()
+            if not path.exists():
+                return json.dumps({"error": f"File not found: {path}"})
+            webbrowser.open(f"file://{path.resolve()}")
+            return json.dumps({"status": "success", "opened": str(path.resolve())})
 
     if name == "list_files":
         path = Path(input["path"]).expanduser()
