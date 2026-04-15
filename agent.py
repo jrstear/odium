@@ -4,6 +4,7 @@ import anthropic
 import fnmatch
 import json
 import os
+import readline  # enables backspace, arrow keys, history in input()
 import subprocess
 import sys
 import time
@@ -34,6 +35,29 @@ you do it — the surveyor should always know what's happening:
   "Ready for you to tag — opening GCPEditorPro at http://localhost:4200"
 Keep it concise. No filler, no over-explaining. A working professional
 is your audience, not a student.
+
+# Starting or entering a job directory
+When you first enter a job directory (new job, resume, or user points you
+at a folder), ALWAYS assess what's there before doing anything:
+
+1. List the directory contents
+2. Identify what each file is (by extension, content, naming)
+3. Determine what stage the job is at based on what exists
+4. Check for a transform.yaml — if missing and you can determine the
+   job name and CRS (from filenames, CSV headers, user input, or other
+   jobs), create a minimal one:
+     job: {job_name}
+     field_crs: "EPSG:XXXX"
+     odm_crs: "EPSG:32613"
+   This enables auto-detection for all downstream tools.
+5. If files don't follow naming conventions, suggest renaming them
+   (with confirmation) so downstream tools work smoothly. Example:
+   "I see `survey_data.csv` — mind if I rename it to
+   `ghostrider_emlid_6529.csv` to match conventions?"
+6. Summarize what you found and propose the next step.
+
+This assessment should feel natural, not like a checklist. Just look
+around, get oriented, and tell the user where things stand.
 
 # Pipeline stages
 A job flows through these stages. The order is typical but not rigid —
@@ -331,6 +355,12 @@ TOOLS = [
                     "type": "number",
                     "description": "Oblique/nadir interleaving (0=equal, 1=all nadir first; default 0.2)",
                 },
+                "out_name": {
+                    "type": "string",
+                    "description": "Output filename for the tagging file (e.g. 'ghostrider'). "
+                                   "Produces {out_name}.txt. Auto-set from transform.yaml job "
+                                   "name if present; pass explicitly when no transform.yaml exists.",
+                },
             },
             "required": ["survey_csv", "images_dir"],
         },
@@ -514,8 +544,9 @@ TOOLS = [
     },
     {
         "name": "open_in_browser",
-        "description": "Open a file or URL in the default browser. Use for HTML reports, "
-                       "GCPEditorPro, or any web content the surveyor needs to see.",
+        "description": "Open a file or URL in the default browser. Use for HTML reports "
+                       "or any web content the surveyor needs to see. "
+                       "For GCPEditorPro, use launch_gcpeditorpro instead.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -525,6 +556,17 @@ TOOLS = [
                 },
             },
             "required": ["path_or_url"],
+        },
+    },
+    {
+        "name": "launch_gcpeditorpro",
+        "description": "Launch GCPEditorPro for tagging. Checks if it's already "
+                       "running on port 4200; if not, starts it from ~/git/GCPEditorPro. "
+                       "Opens Chrome to http://localhost:4200. The surveyor then loads "
+                       "the tagging file and images in the GCPEditorPro UI.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
         },
     },
     {
@@ -549,6 +591,30 @@ TOOLS = [
                 },
             },
             "required": ["action"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "Write text content to a file. Use for creating transform.yaml, "
+                       "config files, or other small text files. Creates parent dirs "
+                       "if needed. Will NOT overwrite existing files unless overwrite=true.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to write",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "File content to write",
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "Allow overwriting existing file (default false)",
+                },
+            },
+            "required": ["path", "content"],
         },
     },
     {
@@ -696,15 +762,24 @@ def _run_geo(args: list[str], timeout: int = 600) -> dict:
     """Run a geo tool via conda run -n geo python ... and return structured result."""
     cmd = ["conda", "run", "-n", "geo", "python"] + args
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except KeyboardInterrupt:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            return {"status": "cancelled", "error": "Cancelled by user (Ctrl-C)"}
         output = {
-            "stdout": _truncate(result.stdout),
-            "stderr": _truncate(result.stderr, 2000),
-            "returncode": result.returncode,
+            "stdout": _truncate(stdout),
+            "stderr": _truncate(stderr, 2000),
+            "returncode": proc.returncode,
         }
-        if result.returncode != 0:
+        if proc.returncode != 0:
             output["status"] = "error"
         else:
             output["status"] = "success"
@@ -753,6 +828,17 @@ def execute_tool(name: str, input: dict) -> str:
             args += ["--cameras", str(Path(cameras).expanduser())]
         if input.get("nadir_weight") is not None:
             args += ["--nadir-weight", str(input["nadir_weight"])]
+        # Pass out_name if provided; if not, infer from job dir name when no transform.yaml
+        out_name = input.get("out_name")
+        if not out_name and not (Path(survey_csv).parent / "transform.yaml").exists():
+            out_name = Path(survey_csv).parent.name  # use directory name as job name
+        if out_name:
+            if not out_name.endswith(".txt"):
+                out_name = f"{out_name}.txt"
+            args += ["--out-name", out_name]
+        # Default out_dir to the survey CSV's directory
+        if not input.get("out_dir"):
+            args += ["--out-dir", str(Path(survey_csv).parent)]
         # sight.py can be slow — give it 30 minutes
         result = _run_geo(args, timeout=1800)
         if cameras and "cameras" not in (input or {}):
@@ -1003,6 +1089,17 @@ def execute_tool(name: str, input: dict) -> str:
         except Exception as e:
             return json.dumps({"error": str(e)})
 
+    if name == "write_file":
+        path = Path(input["path"]).expanduser()
+        if path.exists() and not input.get("overwrite"):
+            return json.dumps({"error": f"File exists (pass overwrite=true to replace): {path}"})
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(input["content"])
+            return json.dumps({"status": "success", "path": str(path), "bytes": len(input["content"])})
+        except Exception as e:
+            return json.dumps({"error": f"Could not write {path}: {e}"})
+
     if name == "save_session_summary":
         job_dir = Path(input["job_dir"]).expanduser()
         state_file = job_dir / ".odium-state.json"
@@ -1021,6 +1118,56 @@ def execute_tool(name: str, input: dict) -> str:
             return json.dumps({"status": "success"})
         except Exception as e:
             return json.dumps({"error": f"Could not write state: {e}"})
+
+    if name == "launch_gcpeditorpro":
+        import socket
+        gep_dir = Path.home() / "git" / "GCPEditorPro"
+        port = 4200
+        url = f"http://localhost:{port}"
+
+        # Check if already running
+        already_running = False
+        try:
+            with socket.create_connection(("localhost", port), timeout=1):
+                already_running = True
+        except (ConnectionRefusedError, OSError):
+            pass
+
+        if already_running:
+            webbrowser.open(url)
+            return json.dumps({"status": "success", "already_running": True, "url": url})
+
+        # Check if source exists
+        if not gep_dir.exists():
+            return json.dumps({"error": f"GCPEditorPro not found at {gep_dir}"})
+
+        # Start it in the background
+        env = os.environ.copy()
+        env["NODE_OPTIONS"] = "--openssl-legacy-provider"
+        try:
+            proc = subprocess.Popen(
+                ["npx", "ng", "serve"],
+                cwd=str(gep_dir),
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            # Wait for it to come up
+            for _ in range(30):
+                time.sleep(1)
+                try:
+                    with socket.create_connection(("localhost", port), timeout=1):
+                        break
+                except (ConnectionRefusedError, OSError):
+                    continue
+            else:
+                return json.dumps({"status": "warning",
+                                   "message": "Started but not responding yet — may need more time",
+                                   "pid": proc.pid, "url": url})
+            webbrowser.open(url)
+            return json.dumps({"status": "success", "started": True, "pid": proc.pid, "url": url})
+        except Exception as e:
+            return json.dumps({"error": f"Failed to start GCPEditorPro: {e}"})
 
     if name == "open_in_browser":
         target = input["path_or_url"]
@@ -1288,59 +1435,68 @@ def run_agent():
         messages.append({"role": "user", "content": user_input})
 
         # Agentic loop: keep going while Claude wants to use tools
-        while True:
-            # Retry with backoff on rate limits
-            for attempt in range(5):
-                try:
-                    response = client.messages.create(
-                        model=MODEL,
-                        max_tokens=1024,
-                        system=SYSTEM_PROMPT,
-                        tools=TOOLS,
-                        messages=messages,
-                    )
+        # Ctrl-C during this loop cancels the current turn, not the session
+        try:
+            while True:
+                # Retry with backoff on rate limits
+                for attempt in range(5):
+                    try:
+                        response = client.messages.create(
+                            model=MODEL,
+                            max_tokens=1024,
+                            system=SYSTEM_PROMPT,
+                            tools=TOOLS,
+                            messages=messages,
+                        )
+                        break
+                    except anthropic.RateLimitError:
+                        wait = min(2 ** attempt * 10, 120)
+                        print(f"\n  [rate limited — waiting {wait}s before retry]")
+                        time.sleep(wait)
+                else:
+                    print("\n  [rate limit exceeded after 5 retries — try again later]")
                     break
-                except anthropic.RateLimitError as e:
-                    wait = min(2 ** attempt * 10, 120)  # 10s, 20s, 40s, 80s, 120s
-                    print(f"\n  [rate limited — waiting {wait}s before retry]")
-                    time.sleep(wait)
-            else:
-                print("\n  [rate limit exceeded after 5 retries — try again later]")
-                break
 
-            # Collect text blocks to print
-            text_parts = []
-            tool_calls = []
-            for block in response.content:
-                if hasattr(block, "text"):
-                    text_parts.append(block.text)
-                elif block.type == "tool_use":
-                    tool_calls.append(block)
+                # Collect text blocks to print
+                text_parts = []
+                tool_calls = []
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        text_parts.append(block.text)
+                    elif block.type == "tool_use":
+                        tool_calls.append(block)
 
-            # Print any text the model produced
-            if text_parts:
-                print(f"\nodium> {''.join(text_parts)}")
+                # Print any text the model produced
+                if text_parts:
+                    print(f"\nodium> {''.join(text_parts)}")
 
-            # If no tool use, we're done with this turn
-            if response.stop_reason != "tool_use":
+                # If no tool use, we're done with this turn
+                if response.stop_reason != "tool_use":
+                    messages.append({"role": "assistant", "content": response.content})
+                    break
+
+                # Execute tool calls
                 messages.append({"role": "assistant", "content": response.content})
-                break
+                tool_results = []
+                for call in tool_calls:
+                    print(f"\n  [{call.name}] {json.dumps(call.input, indent=2)}")
+                    result = execute_tool(call.name, call.input)
+                    print(f"  -> {result[:DISPLAY_LIMIT]}{'...' if len(result) > DISPLAY_LIMIT else ''}")
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": call.id,
+                        "content": result,
+                    })
 
-            # Execute tool calls
-            messages.append({"role": "assistant", "content": response.content})
-            tool_results = []
-            for call in tool_calls:
-                print(f"\n  [{call.name}] {json.dumps(call.input, indent=2)}")
-                result = execute_tool(call.name, call.input)
-                print(f"  -> {result[:DISPLAY_LIMIT]}{'...' if len(result) > DISPLAY_LIMIT else ''}")
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": call.id,
-                    "content": result,
-                })
-
-            messages.append({"role": "user", "content": tool_results})
-            # Loop back — Claude may want to use more tools or produce final text
+                messages.append({"role": "user", "content": tool_results})
+                # Loop back — Claude may want to use more tools or produce final text
+        except KeyboardInterrupt:
+            print("\n  [cancelled — back to prompt]")
+            # Remove the partial turn from history so the conversation stays clean
+            while messages and messages[-1]["role"] != "user":
+                messages.pop()
+            if messages:
+                messages.pop()  # remove the user message that started this turn
 
     print()
 
