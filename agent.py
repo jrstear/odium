@@ -528,6 +528,30 @@ TOOLS = [
         },
     },
     {
+        "name": "file_op",
+        "description": "Perform file operations: move, copy, rename, or delete files. "
+                       "Use for organizing deliverables, cleaning up, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["move", "copy", "delete", "mkdir"],
+                    "description": "Operation to perform",
+                },
+                "src": {
+                    "type": "string",
+                    "description": "Source file/directory path",
+                },
+                "dst": {
+                    "type": "string",
+                    "description": "Destination path (for move/copy)",
+                },
+            },
+            "required": ["action"],
+        },
+    },
+    {
         "name": "save_session_summary",
         "description": "Save a concise summary of this session to the job state file. "
                        "Call this before the session ends (user says quit/done/bye). "
@@ -933,6 +957,51 @@ def execute_tool(name: str, input: dict) -> str:
             return json.dumps({"status": "success", "stage": new_stage, "job_dir": str(job_dir)})
         except Exception as e:
             return json.dumps({"error": f"Could not write state: {e}"})
+
+    if name == "file_op":
+        import shutil
+        action = input["action"]
+        src = Path(input.get("src", "")).expanduser() if input.get("src") else None
+        dst = Path(input.get("dst", "")).expanduser() if input.get("dst") else None
+        try:
+            if action == "move":
+                if not src or not dst:
+                    return json.dumps({"error": "move requires src and dst"})
+                if not src.exists():
+                    return json.dumps({"error": f"Source not found: {src}"})
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dst))
+                return json.dumps({"status": "success", "action": "move", "from": str(src), "to": str(dst)})
+            elif action == "copy":
+                if not src or not dst:
+                    return json.dumps({"error": "copy requires src and dst"})
+                if not src.exists():
+                    return json.dumps({"error": f"Source not found: {src}"})
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if src.is_dir():
+                    shutil.copytree(str(src), str(dst))
+                else:
+                    shutil.copy2(str(src), str(dst))
+                return json.dumps({"status": "success", "action": "copy", "from": str(src), "to": str(dst)})
+            elif action == "delete":
+                if not src:
+                    return json.dumps({"error": "delete requires src"})
+                if not src.exists():
+                    return json.dumps({"error": f"Not found: {src}"})
+                if src.is_dir():
+                    shutil.rmtree(str(src))
+                else:
+                    src.unlink()
+                return json.dumps({"status": "success", "action": "delete", "path": str(src)})
+            elif action == "mkdir":
+                if not src:
+                    return json.dumps({"error": "mkdir requires src"})
+                src.mkdir(parents=True, exist_ok=True)
+                return json.dumps({"status": "success", "action": "mkdir", "path": str(src)})
+            else:
+                return json.dumps({"error": f"Unknown action: {action}"})
+        except Exception as e:
+            return json.dumps({"error": str(e)})
 
     if name == "save_session_summary":
         job_dir = Path(input["job_dir"]).expanduser()
