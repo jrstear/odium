@@ -482,16 +482,56 @@ agent needs real smarts:
   maintainer's account
 - **Pix4D**: deferred to v2 (ODM-only MVP first)
 
+### EC2/ODM decisions (2026-04-15)
+
+**Naming**: use "job" consistently throughout (not "project"). Already in
+workflow diagram, transform.yaml, state file. Grafana dashboards should
+use `job` tag. S3 prefix is `{client}/{job}`.
+
+**Terraform**: odium shells out to terraform in `geo/infra/ec2/`. Terraform
+manages the AWS resources; odium manages the workflow around them.
+Odium exports `TF_VAR_*` from `~/.odium/env` before running terraform.
+
+**Per-job AWS budget**: each job gets an AWS Budget on launch, tagged with
+the job name. Budget = user-confirmed ceiling (e.g. $30). AWS enforces
+it (auto-stop instances at threshold). Not a global first-run budget —
+created per job at launch time.
+
+**Email notifications**: required unless user explicitly opts out. Agent
+asks for email, stores in `~/.odium/env`. On launch: "I'll send status
+updates to you@email.com. ODM will take ~4 hours. Proceed?"
+
+**Multiple concurrent jobs**: each job is independent — own S3 prefix,
+own EC2 instance, own budget. Odium doesn't block parallel runs; helps
+the user manage them if they want multiple.
+
+**S3 download**: only what's needed for deliverables + RMSE, not
+everything. Specifically:
+- `opensfm/reconstruction.topocentric.json` — for RMSE 6a
+- `odm_orthophoto/` — orthophoto for RMSE + packaging
+- `cameras.json` — for future sight.py re-runs
+- NOT: undistorted images, point clouds, DEM (download on demand if needed)
+
+**Cost guardrails (three layers)**:
+1. **AWS Budget** (enforced, per job): auto-stop instances at ceiling.
+   Created by odium at launch time with job tag.
+2. **Pre-launch estimate**: image count × historical rate → estimated
+   cost + 1.5x safety margin. Shown to user for confirmation.
+3. **Runtime monitor**: track elapsed time vs estimate. Alert if 2x
+   over. Optional hard wall-clock timeout.
+
+**Data lifecycle**: tracked in odium-r50 (deferred). Per-job inventory
+of data across local/NAS/S3 with cost tracking and archive assistance.
+
 ## Next steps
 
 1. ~~Validate demand~~ — proceeding; secondary goal is Agent SDK learning
 2. ~~Resolve open questions 1–11~~ — key decisions resolved above;
    Q8 (Pix4D) deferred to v2
 3. ~~Scaffold the project layout~~ — done: `~/git/odium/` separate repo
-4. **Write the system prompt** — encode workflow, personality, safety
-   rails (in progress)
-5. **Get API credits working** — $5 purchased, propagation pending
-6. **Build the agent loop** — terminal-first, stub tools, iterate on
-   the conversational flow
-7. **Add real tool implementations** — wire stubs to actual geo commands
-8. **Add Flask GUI** — presentation layer over the working agent
+4. ~~Write the system prompt~~ — done (iterating)
+5. ~~API credits~~ — working ($5, Haiku default)
+6. ~~Build the agent loop~~ — done (17 tools, terminal-first)
+7. ~~Add real tool implementations~~ — done for local tools
+8. **Wire EC2/ODM** — S3 sync, terraform apply/destroy, monitoring
+9. **Add Flask GUI** — presentation layer over the working agent
