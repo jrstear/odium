@@ -108,6 +108,18 @@ that preceding stages are complete.
   ODM_COMPLETE     Results downloaded from S3
 
 # Monitoring an ODM run (ec2_status / ec2_ssh)
+
+## Startup cooldown — don't monitor too early
+After ec2_launch, the instance needs ~10-15 minutes before SSH is reachable:
+  - ~8-10 min: dnf update + docker install + ODM image pull (~6 GB)
+  - ~1-5 min: S3 image sync (scales with image count/size)
+ec2_status uses SSH and will fail (wasting API tokens on retries) if called
+too early. Check metadata.launch_time in the state file — if less than
+15 minutes have elapsed, tell the user:
+  "Instance launched N minutes ago — it typically needs ~15 min to boot,
+   pull the ODM image, and sync data. Want me to check anyway, or wait?"
+Only check automatically if ≥15 minutes have passed since launch.
+
 When checking ODM status, look for these patterns in the bootstrap log
 (/var/log/odm-bootstrap.log):
 
@@ -569,6 +581,11 @@ TOOLS = [
                     "type": "string",
                     "description": "S3 path prefix matching the upload (e.g. 'bsn/ghostrider2')",
                 },
+                "job_dir": {
+                    "type": "string",
+                    "description": "Path to job directory (e.g. '~/stratus/ghostrider2'). "
+                                   "SSH key is saved here as ssh_key.pem for job isolation.",
+                },
                 "notify_email": {
                     "type": "string",
                     "description": "Email for status notifications (required unless user opts out)",
@@ -580,7 +597,8 @@ TOOLS = [
                 },
                 "ebs_size_gb": {
                     "type": "integer",
-                    "description": "EBS volume size in GB (default: 500). Scale with image count.",
+                    "description": "EBS volume size in GB. Auto-calculated as 25× image size + 30 GB "
+                                   "(min 100 GB) when job_dir is provided and this is omitted.",
                 },
                 "use_spot": {
                     "type": "boolean",
@@ -594,10 +612,16 @@ TOOLS = [
         "name": "ec2_status",
         "description": "Check the status of the running ODM instance. Reads the "
                        "bootstrap log via SSH to determine current pipeline stage, "
-                       "elapsed time, and any errors.",
+                       "elapsed time, and any errors. If SSH key is missing from "
+                       "job_dir, recovers it from terraform state automatically.",
         "input_schema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "job_dir": {
+                    "type": "string",
+                    "description": "Path to job directory for job-specific SSH key lookup",
+                },
+            },
         },
     },
     {
@@ -607,6 +631,10 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
+                "job_dir": {
+                    "type": "string",
+                    "description": "Path to job directory for job-specific SSH key lookup",
+                },
                 "command": {
                     "type": "string",
                     "description": "Command to run on the instance",
@@ -969,6 +997,37 @@ def _truncate(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
     return text[:limit] + f"\n... [{len(text) - limit} chars truncated]"
 
 
+def _resolve_ssh_key(job_dir: str | None, tf_dir: Path) -> Path:
+    """Resolve SSH key: job_dir first, then recover from terraform, fall back to global.
+
+    If the key is missing from job_dir but terraform has state, extracts and saves it.
+    This enables session resume: odium restarts, sees EC2_RUNNING but no local key,
+    and recovers it automatically on the next ec2_status/ec2_ssh call.
+    """
+    # 1. Job-specific key
+    if job_dir:
+        job_key = Path(job_dir).expanduser() / "ssh_key.pem"
+        if job_key.exists():
+            return job_key
+        # Try to recover from terraform
+        try:
+            out = subprocess.run(
+                ["terraform", "output", "-raw", "private_key_pem"],
+                cwd=str(tf_dir), capture_output=True, text=True, timeout=10,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                job_key.write_text(out.stdout)
+                job_key.chmod(0o600)
+                return job_key
+        except Exception:
+            pass
+
+    # 2. Legacy global key
+    global_key = Path(os.environ.get("ODM_SSH_KEY",
+                      "~/.ssh/geo-odm-ec2.pem")).expanduser()
+    return global_key
+
+
 def _run_geo(args: list[str], timeout: int = 600) -> dict:
     """Run a geo tool via conda run -n geo python ... and return structured result."""
     cmd = ["conda", "run", "-n", "geo", "python"] + args
@@ -1182,8 +1241,25 @@ def execute_tool(name: str, input: dict) -> str:
 
         if input.get("instance_type"):
             tf_vars += ["-var", f"instance_type={input['instance_type']}"]
-        if input.get("ebs_size_gb"):
-            tf_vars += ["-var", f"ebs_size_gb={input['ebs_size_gb']}"]
+
+        # Auto-size EBS from images if not explicitly set.
+        # ODM at medium quality uses ~25× raw image size across all stages
+        # (undistorted images, point cloud, mesh, textures, DSM, ortho).
+        # aztec7: 17.6 GB images needed >300 GB disk. Be generous — disk is
+        # cheap (~$0.08/GB-month) vs. a failed run that wastes hours of compute.
+        # Floor of 100 GB (OS + Docker image need ~20 GB).
+        ebs_size = input.get("ebs_size_gb")
+        if not ebs_size:
+            job_dir = input.get("job_dir")
+            if job_dir:
+                images_dir = Path(job_dir).expanduser() / "images"
+                if images_dir.exists():
+                    total_bytes = sum(f.stat().st_size for f in images_dir.iterdir() if f.is_file())
+                    total_gb = total_bytes / (1024 ** 3)
+                    ebs_size = max(100, int(total_gb * 25) + 30)  # 25× images + 30 GB headroom
+        if ebs_size:
+            tf_vars += ["-var", f"ebs_size_gb={ebs_size}"]
+
         if input.get("use_spot"):
             tf_vars += ["-var", "use_spot=true"]
 
@@ -1224,19 +1300,23 @@ def execute_tool(name: str, input: dict) -> str:
                     if out.returncode == 0:
                         result[output_name] = out.stdout.strip()
 
-                # Save SSH key if it doesn't exist yet
-                ssh_key_path = Path(os.environ.get("ODM_SSH_KEY",
-                                   "~/.ssh/geo-odm-ec2.pem")).expanduser()
-                if not ssh_key_path.exists():
-                    key_out = subprocess.run(
-                        ["terraform", "output", "-raw", "private_key_pem"],
-                        cwd=str(tf_dir), capture_output=True, text=True, timeout=10,
-                    )
-                    if key_out.returncode == 0 and key_out.stdout.strip():
-                        ssh_key_path.parent.mkdir(parents=True, exist_ok=True)
-                        ssh_key_path.write_text(key_out.stdout)
-                        ssh_key_path.chmod(0o600)
-                        result["ssh_key_saved"] = str(ssh_key_path)
+                # Save SSH key — always overwrite (each apply generates a new key).
+                # Prefer job-specific path; fall back to global.
+                job_dir = input.get("job_dir")
+                if job_dir:
+                    ssh_key_path = Path(job_dir).expanduser() / "ssh_key.pem"
+                else:
+                    ssh_key_path = Path(os.environ.get("ODM_SSH_KEY",
+                                       "~/.ssh/geo-odm-ec2.pem")).expanduser()
+                key_out = subprocess.run(
+                    ["terraform", "output", "-raw", "private_key_pem"],
+                    cwd=str(tf_dir), capture_output=True, text=True, timeout=10,
+                )
+                if key_out.returncode == 0 and key_out.stdout.strip():
+                    ssh_key_path.parent.mkdir(parents=True, exist_ok=True)
+                    ssh_key_path.write_text(key_out.stdout)
+                    ssh_key_path.chmod(0o600)
+                    result["ssh_key_saved"] = str(ssh_key_path)
 
             return json.dumps(result)
         except subprocess.TimeoutExpired:
@@ -1246,8 +1326,7 @@ def execute_tool(name: str, input: dict) -> str:
 
     if name == "ec2_status":
         tf_dir = GEO_DIR / "infra" / "ec2"
-        ssh_key = Path(os.environ.get("ODM_SSH_KEY",
-                       "~/.ssh/geo-odm-ec2.pem")).expanduser()
+        ssh_key = _resolve_ssh_key(input.get("job_dir"), tf_dir)
 
         # Get IP from terraform
         try:
@@ -1282,8 +1361,7 @@ def execute_tool(name: str, input: dict) -> str:
 
     if name == "ec2_ssh":
         tf_dir = GEO_DIR / "infra" / "ec2"
-        ssh_key = Path(os.environ.get("ODM_SSH_KEY",
-                       "~/.ssh/geo-odm-ec2.pem")).expanduser()
+        ssh_key = _resolve_ssh_key(input.get("job_dir"), tf_dir)
         try:
             ip_out = subprocess.run(
                 ["terraform", "output", "-raw", "public_ip"],
@@ -1963,11 +2041,19 @@ def run_agent():
                 # Loop back — Claude may want to use more tools or produce final text
         except KeyboardInterrupt:
             print("\n  [cancelled — back to prompt]")
-            # Remove the partial turn from history so the conversation stays clean
-            while messages and messages[-1]["role"] != "user":
-                messages.pop()
-            if messages:
-                messages.pop()  # remove the user message that started this turn
+            # If the last message is an assistant turn with tool_use blocks,
+            # inject synthetic tool_results so the API doesn't reject the
+            # next request (every tool_use must have a matching tool_result).
+            if (messages and messages[-1]["role"] == "assistant"
+                    and any(getattr(b, "type", None) == "tool_use"
+                            for b in messages[-1].get("content", []))):
+                pending = [b for b in messages[-1]["content"]
+                           if getattr(b, "type", None) == "tool_use"]
+                messages.append({"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": b.id,
+                     "content": "Cancelled by user (Ctrl-C)"}
+                    for b in pending
+                ]})
 
     print()
 
