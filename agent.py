@@ -95,8 +95,10 @@ that preceding stages are complete.
                    CHKs while it runs?"
   SPLIT_DONE       transform.py split → gcp_list.txt + chk_list.txt.
                    May run twice: once pre-ODM (GCPs only) and once
-                   pre-RMSE (GCPs + CHKs). Second split is safe — GCP
-                   tags don't change between runs.
+                   pre-RMSE (GCPs + CHKs). On the second split, first make a copy 
+		   of gcp_list.txt and then compare it with the new one.
+		   If ODM has started running AND GCP tags have changed, warn 
+		   the user of the inconsistency and ask if they want to restart ODM.
   ODM_RUNNING      ODM processing on EC2 (can overlap with CHK tagging).
                    Present upload + launch as ONE confirmation to the user:
                    "Ready to launch ODM: 126 images (1.7 GB upload ~2 min),
@@ -105,6 +107,16 @@ that preceding stages are complete.
                    each step. Don't ask for separate confirmations unless
                    the user specifically asks to split the steps (e.g.
                    "just upload for now" or "I already uploaded").
+
+                   IMAGE SELECTION: if $ODM_IMAGE_DEFAULT is set in the
+                   environment, use it silently. If unset, call list_odm_images
+                   before ec2_launch and present the results to the user to
+                   pick from — never invent image URIs (e.g. "opendronemap/odm:3.6.0"
+                   does NOT exist on Docker Hub). Docker Hub's 'latest' tag
+                   is ROLLING (alias of master), not the latest stable release;
+                   for stable, use the github_latest_release field in the tool
+                   output. Also call list_odm_images when the user asks "which
+                   images", "list images", "pick the image", etc.
   ODM_COMPLETE     Results downloaded from S3
 
 # Monitoring an ODM run (ec2_status / ec2_ssh)
@@ -278,6 +290,14 @@ When the user says "resume" or opens a job that has state, ALWAYS:
    | `gcp_list.txt` with observations | GCPs tagged + split | ODM |
    | `chk_list.txt` with observations | CHKs tagged + split | RMSE |
    | `chk_list.txt` empty (header only) | CHKs NOT tagged yet | Tag CHKs |
+
+   Before suggesting ANY tagging work, inspect `{job}_tagged.txt` if it
+   exists. Count rows whose 8th column (`confidence`) is `tagged` vs.
+   `projection`/`reconstruction`/empty. If all GCP-* and CHK-* labels
+   already have `tagged` rows, the tagging is complete — proceed to
+   split, do not suggest opening GCPEditorPro. This guards against
+   suggesting tagging when the file was copied or tagged externally
+   (e.g. from a sister job like aztec7→aztec10).
    | `reconstruction.topocentric.json` | ODM complete | RMSE 6a |
    | `rmse-recon.html` | RMSE 6a done | Ortho tagging for 6b |
    | `*_tagged.txt` in ortho dir | Ortho tagging done | RMSE 6b |
@@ -569,6 +589,24 @@ TOOLS = [
         },
     },
     {
+        "name": "list_odm_images",
+        "description": "List ODM Docker images available to launch, from three sources: "
+                       "(1) ECR — the user's custom builds (e.g. v3.6.0-baseline, v3.6.0-projected); "
+                       "(2) Docker Hub — official opendronemap/odm tags; "
+                       "(3) GitHub — latest stable release tag from OpenDroneMap/ODM. "
+                       "Call this before ec2_launch when the user hasn't specified an image "
+                       "and $ODM_IMAGE_DEFAULT is unset. Also call on explicit requests "
+                       "(\"which images\", \"list images\", \"pick the image\"). "
+                       "IMPORTANT: Docker Hub's 'latest' tag is an alias of 'master' "
+                       "(rolling), NOT the latest stable release — use github_latest_release "
+                       "for that. Do NOT invent image URIs (e.g. opendronemap/odm:3.6.0 does "
+                       "not exist).",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
         "name": "ec2_launch",
         "description": "Launch an EC2 instance for ODM processing via terraform apply. "
                        "Requires S3 data already uploaded. Creates SNS topic for "
@@ -588,7 +626,19 @@ TOOLS = [
                 },
                 "notify_email": {
                     "type": "string",
-                    "description": "Email for status notifications (required unless user opts out)",
+                    "description": "Email for status notifications. Usually leave this unset — "
+                                   "$ODM_NOTIFY_EMAIL from ~/.odium/env is the correct default. "
+                                   "Do NOT invent placeholders like surveyor@example.com; if the "
+                                   "env default is missing, ask the user rather than making one up.",
+                },
+                "odm_image": {
+                    "type": "string",
+                    "description": "ODM Docker image to run (e.g. "
+                                   "'658302145097.dkr.ecr.us-west-2.amazonaws.com/odm:v3.6.0-baseline'). "
+                                   "Leave unset to use $ODM_IMAGE_DEFAULT from ~/.odium/env, or the "
+                                   "terraform default (opendronemap/odm:3.5.6) if neither is set. "
+                                   "For validation runs against specific ODM versions, the caller "
+                                   "should pass this explicitly.",
                 },
                 "instance_type": {
                     "type": "string",
@@ -676,7 +726,14 @@ TOOLS = [
         "name": "ec2_destroy",
         "description": "Tear down the EC2 instance via terraform destroy. Cancels "
                        "spot request, deletes EBS volume, cleans up security group. "
-                       "S3 data is preserved. ALWAYS confirm before destroying.",
+                       "S3 data is preserved. ALWAYS confirm before destroying. "
+                       "If this tool returns status='error' or status='partial', "
+                       "STOP and tell the user — do NOT attempt SSH workarounds "
+                       "(e.g. 'sudo shutdown -h'). Halt is NOT termination: the "
+                       "instance stays stopped, EBS keeps billing, and terraform "
+                       "state remains dirty. Surface the stderr to the user and "
+                       "let them investigate. The tool auto-retries the known "
+                       "SNS 'invalid principals' Terraform error with -refresh=false.",
         "input_schema": {
             "type": "object",
             "properties": {},
@@ -1226,6 +1283,90 @@ def execute_tool(name: str, input: dict) -> str:
         results["s3_base"] = s3_base
         return json.dumps(results)
 
+    if name == "list_odm_images":
+        result = {"ecr": [], "dockerhub": [], "github_latest_release": None}
+        ecr_repo = "658302145097.dkr.ecr.us-west-2.amazonaws.com/odm"
+
+        # ECR — user's custom builds
+        try:
+            proc = subprocess.run(
+                ["aws", "ecr", "describe-images",
+                 "--region", "us-west-2",
+                 "--repository-name", "odm",
+                 "--output", "json"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode == 0:
+                details = json.loads(proc.stdout).get("imageDetails", [])
+                details.sort(key=lambda d: d.get("imagePushedAt", ""), reverse=True)
+                for img in details:
+                    for tag in img.get("imageTags", []):
+                        result["ecr"].append({
+                            "uri": f"{ecr_repo}:{tag}",
+                            "tag": tag,
+                            "size_mb": round(img["imageSizeInBytes"] / (1024 * 1024), 1),
+                            "pushed": img.get("imagePushedAt", "")[:19],
+                        })
+            else:
+                result["ecr_error"] = proc.stderr.strip()[:500]
+        except Exception as e:
+            result["ecr_error"] = str(e)
+
+        # Docker Hub — official opendronemap/odm tags
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "https://hub.docker.com/v2/repositories/opendronemap/odm/tags/?page_size=50",
+                headers={"User-Agent": "odium/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+            picks = []
+            for t in data.get("results", []):
+                n = t["name"]
+                # Keep: numeric-version tags (e.g. 3.5.6), 'master', 'latest', 'gpu'
+                is_version = bool(n) and n[0].isdigit() and "." in n and len(n) < 10
+                if is_version or n in ("master", "latest", "gpu"):
+                    annotation = ""
+                    if n == "latest":
+                        annotation = "alias of master — ROLLING, not latest stable release"
+                    elif n == "master":
+                        annotation = "rolling tip of upstream master"
+                    elif n == "gpu":
+                        annotation = "GPU-enabled variant (see gpu.Dockerfile)"
+                    picks.append({
+                        "uri": f"opendronemap/odm:{n}",
+                        "tag": n,
+                        "pushed": t.get("last_updated", "")[:19],
+                        "note": annotation,
+                    })
+                if len(picks) >= 10:
+                    break
+            result["dockerhub"] = picks
+        except Exception as e:
+            result["dockerhub_error"] = str(e)[:500]
+
+        # GitHub — latest stable release
+        try:
+            proc = subprocess.run(
+                ["gh", "release", "view",
+                 "--repo", "OpenDroneMap/ODM",
+                 "--json", "tagName,publishedAt"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                rel = json.loads(proc.stdout)
+                result["github_latest_release"] = {
+                    "tag": rel.get("tagName", ""),
+                    "published": (rel.get("publishedAt") or "")[:19],
+                    "note": "this is the latest stable RELEASE; there may not be "
+                            "a matching Docker Hub tag (Docker Hub tends to lag)",
+                }
+        except Exception as e:
+            result["github_error"] = str(e)[:500]
+
+        return json.dumps(result)
+
     if name == "ec2_launch":
         s3_prefix = input["s3_prefix"]
         tf_dir = GEO_DIR / "infra" / "ec2"
@@ -1235,9 +1376,30 @@ def execute_tool(name: str, input: dict) -> str:
         # Build terraform args
         tf_vars = ["-var", f"project={s3_prefix}"]  # terraform still uses 'project' (geo-q77a)
 
-        notify_email = input.get("notify_email") or os.environ.get("ODM_NOTIFY_EMAIL", "")
+        # Guard against LLM-hallucinated placeholder emails (surveyor@example.com etc).
+        # Real user emails come from ~/.odium/env as ODM_NOTIFY_EMAIL.
+        raw_email = (input.get("notify_email") or "").strip()
+        placeholder_patterns = (
+            "@example.com", "@example.org", "@example.net",
+            "surveyor@", "user@", "test@", "your-email@",
+        )
+        if raw_email and any(p in raw_email.lower() for p in placeholder_patterns):
+            print(f"   ⚠️  ignoring placeholder email '{raw_email}' — falling back to $ODM_NOTIFY_EMAIL",
+                  file=sys.stderr)
+            raw_email = ""
+        notify_email = raw_email or os.environ.get("ODM_NOTIFY_EMAIL", "")
         if notify_email:
             tf_vars += ["-var", f"notify_email={notify_email}"]
+
+        # ODM Docker image — honor input, then env default, else let terraform default apply.
+        odm_image = (input.get("odm_image") or os.environ.get("ODM_IMAGE_DEFAULT", "")).strip()
+        if odm_image:
+            tf_vars += ["-var", f"odm_image={odm_image}"]
+            print(f"   🐳 odm_image={odm_image}", file=sys.stderr)
+        else:
+            print("   ⚠️  no odm_image specified — using terraform default "
+                  "(opendronemap/odm:3.5.6). For validation runs this is likely wrong.",
+                  file=sys.stderr)
 
         if input.get("instance_type"):
             tf_vars += ["-var", f"instance_type={input['instance_type']}"]
@@ -1274,10 +1436,22 @@ def execute_tool(name: str, input: dict) -> str:
             "GRAFANA_LOKI_URL": "TF_VAR_grafana_loki_url",
             "GRAFANA_LOKI_USER": "TF_VAR_grafana_loki_user",
         }
+        grafana_present = []
+        grafana_missing = []
         for env_key, tf_key in grafana_map.items():
             val = os.environ.get(env_key, "")
             if val:
                 env[tf_key] = val
+                grafana_present.append(env_key)
+            else:
+                grafana_missing.append(env_key)
+        if grafana_present:
+            print(f"   📊 grafana TF_VARs set: {len(grafana_present)}/{len(grafana_map)} "
+                  f"({', '.join(grafana_present)})", file=sys.stderr)
+        if grafana_missing:
+            print(f"   ⚠️  grafana TF_VARs missing: {', '.join(grafana_missing)} — "
+                  f"telemetry will be disabled for those endpoints. Check ~/.odium/env.",
+                  file=sys.stderr)
 
         try:
             proc = subprocess.run(
@@ -1442,15 +1616,62 @@ def execute_tool(name: str, input: dict) -> str:
             proc = subprocess.run(
                 ["terraform", "destroy", "-auto-approve"],
                 cwd=str(tf_dir),
-                capture_output=True, text=True, timeout=300,
+                capture_output=True, text=True, timeout=600,
             )
+            stdout, stderr, rc = proc.stdout, proc.stderr, proc.returncode
+
+            # Known Terraform-AWS provider issue: SNS topic refresh sometimes
+            # fails with "contains invalid principals". Retry with -refresh=false.
+            if rc != 0 and "contains invalid principals" in stderr:
+                print("   ⚠️  SNS principal refresh error — retrying with -refresh=false",
+                      file=sys.stderr)
+                proc = subprocess.run(
+                    ["terraform", "destroy", "-auto-approve", "-refresh=false"],
+                    cwd=str(tf_dir),
+                    capture_output=True, text=True, timeout=600,
+                )
+                stdout = (stdout + "\n--- retry with -refresh=false ---\n" + proc.stdout)
+                stderr = (stderr + "\n--- retry with -refresh=false ---\n" + proc.stderr)
+                rc = proc.returncode
+
+            # Verify no odm-tagged instances survived the destroy.
+            # Guards against false-success: terraform can report ok while
+            # leaving resources behind in corner cases.
+            survivors = []
+            try:
+                verify = subprocess.run(
+                    ["aws", "ec2", "describe-instances",
+                     "--region", "us-west-2",
+                     "--filters", "Name=tag:Purpose,Values=odm-run",
+                                  "Name=instance-state-name,Values=running,stopped,stopping,pending",
+                     "--query", "Reservations[].Instances[].InstanceId",
+                     "--output", "json"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if verify.returncode == 0 and verify.stdout.strip():
+                    survivors = json.loads(verify.stdout.strip())
+            except Exception:
+                pass  # verification is best-effort
+
+            if rc == 0 and not survivors:
+                status = "success"
+            elif rc == 0 and survivors:
+                status = "partial"
+                stderr += (f"\n⚠️  terraform reported success but {len(survivors)} "
+                           f"odm-run instance(s) remain: {survivors}. "
+                           f"Manual cleanup required (aws ec2 terminate-instances).")
+            else:
+                status = "error"
+
             return json.dumps({
-                "status": "success" if proc.returncode == 0 else "error",
-                "stdout": _truncate(proc.stdout),
-                "stderr": _truncate(proc.stderr, 2000),
+                "status": status,
+                "stdout": _truncate(stdout),
+                "stderr": _truncate(stderr, 2000),
+                "survivors": survivors,
             })
         except subprocess.TimeoutExpired:
-            return json.dumps({"error": "terraform destroy timed out (5 min)"})
+            return json.dumps({"error": "terraform destroy timed out (10 min) — "
+                                        "instance may still be live; check AWS console"})
         except Exception as e:
             return json.dumps({"error": str(e)})
 
