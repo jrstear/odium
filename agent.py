@@ -1573,10 +1573,15 @@ def execute_tool(name: str, input: dict) -> str:
         if profile != "default":
             aws_base = ["aws", "--profile", profile, "s3"]
 
-        # Default: only what's needed for RMSE + packaging
+        # Default: only what's needed for RMSE + packaging.
+        # Historical bug: syncing odm_orthophoto/ (trailing slash) pulled the
+        # 1.6 GB cloud-optimized .tif in addition to the 1.2 GB raw raster.
+        # rmse 6b only needs the raw raster; internal GeoTIFF tags carry
+        # georeferencing, so no sidecars required.
         downloads = [
             ("opensfm/reconstruction.topocentric.json", "opensfm/"),
-            ("odm_orthophoto/", "odm_orthophoto/"),
+            ("odm_orthophoto/odm_orthophoto.original.tif", "odm_orthophoto/"),
+            ("odm_report/", "odm_report/"),
             ("cameras.json", "."),
         ]
         # Add extra paths if requested
