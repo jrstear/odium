@@ -402,6 +402,17 @@ to figure out what you have**, then confirm with the user before proceeding.
 - 0 tagged observations after split → almost certainly used wrong file
 - 0 GCP or 0 CHK after split → user may not have assigned roles
 - Flag these immediately rather than rationalizing empty results.
+
+### Ortho-tagged file fallback (step 6b)
+GCPEditorPro's "Download" button writes to the browser's download folder
+(`~/Downloads/` on macOS), NOT back into the job directory. So for step 6b:
+- Expected path: `{job_dir}/odm_orthophoto/odm_orthophoto.original_tagged.txt`
+- If missing there, ALWAYS check `~/Downloads/odm_orthophoto.original_tagged.txt`
+  (and any recent `*_tagged.txt` in `~/Downloads/`) before asking the user.
+- When you find it there, MOVE it into `{job_dir}/odm_orthophoto/` (don't
+  copy — keeps Downloads tidy and ensures only one canonical location).
+- Same fallback applies to `{job}_tagged.txt` for the pre-ODM tagging step:
+  check `~/Downloads/` before asking.
 """
 
 TOOLS = [
