@@ -80,9 +80,16 @@ that preceding stages are complete.
   SURVEY           Field survey with Emlid. You can help troubleshoot
                    (e.g. NTRIP issues, base setup) — you know job-specific
                    and site-specific details that a general assistant won't.
-  DC_PARSED        transform.py dc — parse Trimble .dc → survey CSVs +
-                   transform.yaml (CRS, design grid shift params)
-  SURVEY_LOADED    Emlid field-survey CSV loaded (coordinates + CRS)
+  DC_PARSED        transform.py dc — parse Trimble .dc → CONTROL-MONUMENT
+                   CSVs ({job}_{epsg}.csv, {job}_design.csv) + transform.yaml.
+                   These are anchor points for Emlid base setup, NOT the
+                   GCP/CHK targets that get tagged in images. Do not feed
+                   {job}_{epsg}.csv to sight.py.
+  SURVEY_LOADED    Emlid field-survey CSV loaded (e.g. {job}_emlid_{epsg}.csv).
+                   This file contains the actual GCP/CHK targets the surveyor
+                   measured in the field — it is what sight.py needs.
+                   Required before SIGHT_DONE: if you only have the .dc-
+                   derived CSV, STOP and ask the user for the Emlid CSV.
   IMAGES_LOADED    Drone images directory identified
   SIGHT_DONE       sight.py — match targets to images → {job}.txt
   TAGGED           Surveyor tags in GCPEditorPro. Track what's tagged
@@ -450,16 +457,26 @@ TOOLS = [
     },
     {
         "name": "run_sight",
-        "description": "Run sight.py to match survey targets to drone images. "
-                       "Produces {job}.txt (GCP file for tagging) and marks.csv. "
-                       "This can take several minutes on large image sets. "
-                       "Auto-loads transform.yaml from the survey CSV directory if present.",
+        "description": "Run sight.py to match field-surveyed GCP/CHK targets to drone "
+                       "images. Produces {job}.txt (GCP file for tagging) and marks.csv. "
+                       "Takes several minutes on large image sets. Auto-loads "
+                       "transform.yaml from the survey CSV directory if present. "
+                       "PREREQUISITE: the input must be the Emlid field-survey CSV "
+                       "(typically named {job}_emlid_{epsg}.csv) — i.e. the targets "
+                       "the surveyor measured in the field with the rover. Do NOT run "
+                       "this on the {job}_{epsg}.csv produced by transform_dc — that "
+                       "file contains only the control monuments from the .dc, not the "
+                       "GCP/CHK targets to tag. If you only see the transform_dc output, "
+                       "STOP and ask the user to provide the Emlid field-survey CSV.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "survey_csv": {
                     "type": "string",
-                    "description": "Path to the survey CSV (Emlid or from transform_dc)",
+                    "description": "Path to the Emlid field-survey CSV "
+                                   "(e.g. {job}_emlid_6529.csv). Must contain the "
+                                   "GCP/CHK targets surveyed in the field — NOT the "
+                                   "control monuments from transform_dc.",
                 },
                 "images_dir": {
                     "type": "string",
