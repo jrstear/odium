@@ -5,6 +5,7 @@ import fnmatch
 import json
 import os
 import readline  # enables backspace, arrow keys, history in input()
+import shutil
 import subprocess
 import sys
 import time
@@ -576,9 +577,10 @@ TOOLS = [
     {
         "name": "s3_upload",
         "description": "Upload job data to S3 for ODM processing. Syncs images/ and "
-                       "gcp_list.txt to s3://{bucket}/{client}/{job}/. Confirms cost "
-                       "implications before proceeding. Large uploads (>10 GB) may "
-                       "take 10-30 minutes.",
+                       "gcp_list.txt to s3://{bucket}/{s3_prefix}/. Defaults s3_prefix "
+                       "to the job_dir basename (e.g. ~/stratus/aztec13/ → 'aztec13'). "
+                       "Confirms cost implications before proceeding. Large uploads "
+                       "(>10 GB) may take 10-30 minutes.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -588,15 +590,16 @@ TOOLS = [
                 },
                 "s3_prefix": {
                     "type": "string",
-                    "description": "S3 path prefix (e.g. 'bsn/ghostrider2'). "
-                                   "Data goes to s3://{bucket}/{s3_prefix}/",
+                    "description": "S3 path prefix. Defaults to job_dir basename (e.g. "
+                                   "'aztec13'). Override only when continuing a job under "
+                                   "an older customer-prefixed path like 'bsn/aztec11'.",
                 },
                 "bucket": {
                     "type": "string",
                     "description": "S3 bucket name (default: stratus-jrstear)",
                 },
             },
-            "required": ["job_dir", "s3_prefix"],
+            "required": ["job_dir"],
         },
     },
     {
@@ -619,21 +622,34 @@ TOOLS = [
     },
     {
         "name": "ec2_launch",
-        "description": "Launch an EC2 instance for ODM processing via terraform apply. "
-                       "Requires S3 data already uploaded. Creates SNS topic for "
-                       "notifications. Exports Grafana vars from ~/.odium/env if present. "
+        "description": "Launch an EC2 instance for ODM processing via terragrunt apply "
+                       "in {job_dir}/ec2/. Requires S3 data already uploaded. Creates "
+                       "per-job IAM role, security group, key pair, SNS topic, and "
+                       "EventBridge rules (all suffixed with job_name for concurrent jobs). "
+                       "Exports Grafana vars from ~/.odium/env if present. "
                        "ALWAYS confirm cost estimate and email before launching.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "s3_prefix": {
                     "type": "string",
-                    "description": "S3 path prefix matching the upload (e.g. 'bsn/ghostrider2')",
+                    "description": "S3 path prefix matching the upload. Defaults to "
+                                   "job_dir basename (e.g. 'aztec13'). Override only "
+                                   "when the job's data lives under an older customer-"
+                                   "prefixed path like 'bsn/aztec11'.",
                 },
                 "job_dir": {
                     "type": "string",
                     "description": "Path to job directory (e.g. '~/stratus/ghostrider2'). "
-                                   "SSH key is saved here as ssh_key.pem for job isolation.",
+                                   "Per-job terragrunt state lives at {job_dir}/ec2/, and "
+                                   "SSH key is saved at {job_dir}/ssh_key.pem for job isolation. "
+                                   "Required — enables concurrent jobs without collision.",
+                },
+                "job_name": {
+                    "type": "string",
+                    "description": "Suffix for globally-named AWS resources (IAM role, SG, "
+                                   "key pair, SNS topic, EventBridge rules, S3 scripts prefix). "
+                                   "Defaults to job_dir basename (e.g. 'ghostrider2').",
                 },
                 "notify_email": {
                     "type": "string",
@@ -666,7 +682,7 @@ TOOLS = [
                     "description": "Use spot instances (default: false — on-demand is more reliable)",
                 },
             },
-            "required": ["s3_prefix"],
+            "required": ["job_dir"],
         },
     },
     {
@@ -674,15 +690,17 @@ TOOLS = [
         "description": "Check the status of the running ODM instance. Reads the "
                        "bootstrap log via SSH to determine current pipeline stage, "
                        "elapsed time, and any errors. If SSH key is missing from "
-                       "job_dir, recovers it from terraform state automatically.",
+                       "job_dir, recovers it from terragrunt state automatically.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "job_dir": {
                     "type": "string",
-                    "description": "Path to job directory for job-specific SSH key lookup",
+                    "description": "Path to job directory ({job_dir}/ec2/ holds the per-job "
+                                   "terragrunt state and {job_dir}/ssh_key.pem holds the SSH key)",
                 },
             },
+            "required": ["job_dir"],
         },
     },
     {
@@ -694,14 +712,15 @@ TOOLS = [
             "properties": {
                 "job_dir": {
                     "type": "string",
-                    "description": "Path to job directory for job-specific SSH key lookup",
+                    "description": "Path to job directory ({job_dir}/ec2/ holds the per-job "
+                                   "terragrunt state and {job_dir}/ssh_key.pem holds the SSH key)",
                 },
                 "command": {
                     "type": "string",
                     "description": "Command to run on the instance",
                 },
             },
-            "required": ["command"],
+            "required": ["command", "job_dir"],
         },
     },
     {
@@ -718,7 +737,9 @@ TOOLS = [
                 },
                 "s3_prefix": {
                     "type": "string",
-                    "description": "S3 path prefix (e.g. 'bsn/ghostrider2')",
+                    "description": "S3 path prefix. Defaults to job_dir basename (e.g. "
+                                   "'aztec13'). Override only when downloading from an "
+                                   "older customer-prefixed path like 'bsn/aztec11'.",
                 },
                 "bucket": {
                     "type": "string",
@@ -730,24 +751,32 @@ TOOLS = [
                     "description": "Additional S3 subdirs to download (e.g. ['odm_dem', 'odm_report'])",
                 },
             },
-            "required": ["job_dir", "s3_prefix"],
+            "required": ["job_dir"],
         },
     },
     {
         "name": "ec2_destroy",
-        "description": "Tear down the EC2 instance via terraform destroy. Cancels "
-                       "spot request, deletes EBS volume, cleans up security group. "
-                       "S3 data is preserved. ALWAYS confirm before destroying. "
-                       "If this tool returns status='error' or status='partial', "
-                       "STOP and tell the user — do NOT attempt SSH workarounds "
-                       "(e.g. 'sudo shutdown -h'). Halt is NOT termination: the "
-                       "instance stays stopped, EBS keeps billing, and terraform "
-                       "state remains dirty. Surface the stderr to the user and "
-                       "let them investigate. The tool auto-retries the known "
-                       "SNS 'invalid principals' Terraform error with -refresh=false.",
+        "description": "Tear down the EC2 instance via terragrunt destroy in "
+                       "{job_dir}/ec2/. Cancels spot request, deletes EBS volume, "
+                       "cleans up security group, removes SNS topic and EventBridge "
+                       "rules. S3 data is preserved. After successful destroy, "
+                       "auto-cleans local terragrunt artifacts (.terragrunt-cache, "
+                       "terraform.tfstate*, .terraform). ALWAYS confirm before "
+                       "destroying. If this tool returns status='error' or "
+                       "status='partial', STOP and tell the user — do NOT attempt "
+                       "SSH workarounds (e.g. 'sudo shutdown -h'). Halt is NOT "
+                       "termination: the instance stays stopped, EBS keeps billing, "
+                       "and state remains dirty. Auto-retries the known SNS "
+                       "'invalid principals' Terraform error with -refresh=false.",
         "input_schema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "job_dir": {
+                    "type": "string",
+                    "description": "Path to job directory whose ec2/ subdir holds the per-job state",
+                },
+            },
+            "required": ["job_dir"],
         },
     },
     {
@@ -1054,6 +1083,12 @@ GEO_DIR = Path(__file__).parent.parent / "geo"  # ~/git/geo
 if not GEO_DIR.exists():
     GEO_DIR = Path.home() / "git" / "geo"
 
+# Terragrunt template path under the geo checkout.  Per-job copies live at
+# {job_dir}/ec2/terragrunt.hcl (see geo-elmk).  The template uses GEO_HOME
+# (env var) to resolve the source terraform module at runtime, so the same
+# file works on any machine that exports GEO_HOME.
+TERRAGRUNT_TEMPLATE = GEO_DIR / "infra" / "terragrunt" / "ec2" / "terragrunt.hcl"
+
 
 MAX_TOOL_OUTPUT = 4000  # chars — keeps conversation lean
 
@@ -1065,35 +1100,62 @@ def _truncate(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
     return text[:limit] + f"\n... [{len(text) - limit} chars truncated]"
 
 
-def _resolve_ssh_key(job_dir: str | None, tf_dir: Path) -> Path:
-    """Resolve SSH key: job_dir first, then recover from terraform, fall back to global.
+def _terragrunt_dir(job_dir: str) -> Path:
+    """Return {job_dir}/ec2/, idempotently materializing the terragrunt template.
 
-    If the key is missing from job_dir but terraform has state, extracts and saves it.
-    This enables session resume: odium restarts, sees EC2_RUNNING but no local key,
-    and recovers it automatically on the next ec2_status/ec2_ssh call.
+    The template lives at $GEO_HOME/infra/terragrunt/ec2/terragrunt.hcl and
+    references its source module via $GEO_HOME at runtime — no file-copy
+    substitution needed.  Safe to call on every tool invocation.
     """
-    # 1. Job-specific key
-    if job_dir:
-        job_key = Path(job_dir).expanduser() / "ssh_key.pem"
-        if job_key.exists():
-            return job_key
-        # Try to recover from terraform
-        try:
-            out = subprocess.run(
-                ["terraform", "output", "-raw", "private_key_pem"],
-                cwd=str(tf_dir), capture_output=True, text=True, timeout=10,
+    tg_dir = Path(job_dir).expanduser() / "ec2"
+    tg_dir.mkdir(parents=True, exist_ok=True)
+    tg_file = tg_dir / "terragrunt.hcl"
+    if not tg_file.exists():
+        if not TERRAGRUNT_TEMPLATE.exists():
+            raise FileNotFoundError(
+                f"Terragrunt template missing: {TERRAGRUNT_TEMPLATE}. "
+                f"Check that {GEO_DIR} is a valid geo checkout."
             )
-            if out.returncode == 0 and out.stdout.strip():
-                job_key.write_text(out.stdout)
-                job_key.chmod(0o600)
-                return job_key
-        except Exception:
-            pass
+        tg_file.write_text(TERRAGRUNT_TEMPLATE.read_text())
+    return tg_dir
 
-    # 2. Legacy global key
-    global_key = Path(os.environ.get("ODM_SSH_KEY",
-                      "~/.ssh/geo-odm-ec2.pem")).expanduser()
-    return global_key
+
+def _terragrunt_env(s3_prefix: str, job_name: str) -> dict[str, str]:
+    """Build env dict for terragrunt invocations: GEO_HOME + ODM_PROJECT/JOB_NAME
+    on top of the current process env (which already includes GRAFANA_*, AWS_*,
+    ODM_NOTIFY_EMAIL, ODM_IMAGE_DEFAULT, etc., loaded from ~/.odium/env).
+    """
+    env = os.environ.copy()
+    env["GEO_HOME"] = str(GEO_DIR)
+    env["ODM_PROJECT"] = s3_prefix
+    env["ODM_JOB_NAME"] = job_name
+    return env
+
+
+def _resolve_ssh_key(job_dir: str) -> Path:
+    """Return the path to {job_dir}/ssh_key.pem, recovering from terragrunt
+    state if missing.  Recovery enables session resume: odium restarts, sees
+    EC2_RUNNING but no local key, and recovers it on the next ec2_status call.
+    """
+    job_key = Path(job_dir).expanduser() / "ssh_key.pem"
+    if job_key.exists():
+        return job_key
+    tg_dir = _terragrunt_dir(job_dir)
+    env = os.environ.copy()
+    env["GEO_HOME"] = str(GEO_DIR)
+    try:
+        out = subprocess.run(
+            ["terragrunt", "output", "-raw", "private_key_pem"],
+            cwd=str(tg_dir), env=env,
+            capture_output=True, text=True, timeout=15,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            job_key.write_text(out.stdout)
+            job_key.chmod(0o600)
+            return job_key
+    except Exception:
+        pass
+    return job_key  # caller will see the file is missing and fail with a useful error
 
 
 def _run_geo(args: list[str], timeout: int = 600) -> dict:
@@ -1246,7 +1308,9 @@ def execute_tool(name: str, input: dict) -> str:
     if name == "s3_upload":
         job_dir = Path(input["job_dir"]).expanduser()
         bucket = input.get("bucket", "stratus-jrstear")
-        s3_prefix = input["s3_prefix"]
+        # Default s3_prefix to the job_dir basename — drop the bsn/ customer
+        # prefix that older jobs (aztec11, aztec12) used.
+        s3_prefix = input.get("s3_prefix") or job_dir.name
         s3_base = f"s3://{bucket}/{s3_prefix}"
         results = {}
         profile = os.environ.get("AWS_PROFILE", "default")
@@ -1379,13 +1443,22 @@ def execute_tool(name: str, input: dict) -> str:
         return json.dumps(result)
 
     if name == "ec2_launch":
-        s3_prefix = input["s3_prefix"]
-        tf_dir = GEO_DIR / "infra" / "ec2"
-        if not tf_dir.exists():
-            return json.dumps({"error": f"Terraform dir not found: {tf_dir}"})
+        job_dir = input.get("job_dir")
+        if not job_dir:
+            return json.dumps({"status": "error",
+                               "error": "job_dir is required (per-job terragrunt state lives there)"})
 
-        # Build terraform args
-        tf_vars = ["-var", f"project={s3_prefix}"]  # terraform still uses 'project' (geo-q77a)
+        # Default s3_prefix and job_name to the job_dir basename.  Override
+        # s3_prefix only when continuing a job under an older customer-
+        # prefixed path like 'bsn/aztec11'.
+        s3_prefix = input.get("s3_prefix") or Path(job_dir).expanduser().name
+        job_name = input.get("job_name") or Path(job_dir).expanduser().name
+        try:
+            tg_dir = _terragrunt_dir(job_dir)
+        except Exception as e:
+            return json.dumps({"status": "error", "error": str(e)})
+
+        env = _terragrunt_env(s3_prefix, job_name)
 
         # Guard against LLM-hallucinated placeholder emails (surveyor@example.com etc).
         # Real user emails come from ~/.odium/env as ODM_NOTIFY_EMAIL.
@@ -1399,21 +1472,23 @@ def execute_tool(name: str, input: dict) -> str:
                   file=sys.stderr)
             raw_email = ""
         notify_email = raw_email or os.environ.get("ODM_NOTIFY_EMAIL", "")
-        if notify_email:
-            tf_vars += ["-var", f"notify_email={notify_email}"]
+        if not notify_email:
+            return json.dumps({"status": "error",
+                               "error": "notify_email is required (input or $ODM_NOTIFY_EMAIL)"})
+        env["ODM_NOTIFY_EMAIL"] = notify_email
 
-        # ODM Docker image — honor input, then env default, else let terraform default apply.
+        # ODM Docker image — honor input, then env default, else let terragrunt default apply.
         odm_image = (input.get("odm_image") or os.environ.get("ODM_IMAGE_DEFAULT", "")).strip()
         if odm_image:
-            tf_vars += ["-var", f"odm_image={odm_image}"]
+            env["ODM_IMAGE"] = odm_image
             print(f"   🐳 odm_image={odm_image}", file=sys.stderr)
         else:
-            print("   ⚠️  no odm_image specified — using terraform default "
+            print("   ⚠️  no odm_image specified — using terragrunt default "
                   "(opendronemap/odm:3.5.6). For validation runs this is likely wrong.",
                   file=sys.stderr)
 
         if input.get("instance_type"):
-            tf_vars += ["-var", f"instance_type={input['instance_type']}"]
+            env["ODM_INSTANCE_TYPE"] = input["instance_type"]
 
         # Auto-size EBS from images if not explicitly set.
         # ODM at medium quality uses ~25× raw image size across all stages
@@ -1423,79 +1498,76 @@ def execute_tool(name: str, input: dict) -> str:
         # Floor of 100 GB (OS + Docker image need ~20 GB).
         ebs_size = input.get("ebs_size_gb")
         if not ebs_size:
-            job_dir = input.get("job_dir")
-            if job_dir:
-                images_dir = Path(job_dir).expanduser() / "images"
-                if images_dir.exists():
-                    total_bytes = sum(f.stat().st_size for f in images_dir.iterdir() if f.is_file())
-                    total_gb = total_bytes / (1024 ** 3)
-                    ebs_size = max(100, int(total_gb * 25) + 30)  # 25× images + 30 GB headroom
+            images_dir = Path(job_dir).expanduser() / "images"
+            if images_dir.exists():
+                total_bytes = sum(f.stat().st_size for f in images_dir.iterdir() if f.is_file())
+                total_gb = total_bytes / (1024 ** 3)
+                ebs_size = max(100, int(total_gb * 25) + 30)  # 25× images + 30 GB headroom
         if ebs_size:
-            tf_vars += ["-var", f"ebs_size_gb={ebs_size}"]
+            env["ODM_EBS_SIZE_GB"] = str(ebs_size)
 
         if input.get("use_spot"):
-            tf_vars += ["-var", "use_spot=true"]
+            env["ODM_USE_SPOT"] = "true"
 
-        # Export Grafana TF_VARs from env
-        env = os.environ.copy()
-        grafana_map = {
-            "GRAFANA_API_KEY": "TF_VAR_grafana_api_key",
-            "GRAFANA_SA_KEY": "TF_VAR_grafana_sa_key",
-            "GRAFANA_STACK_URL": "TF_VAR_grafana_stack_url",
-            "GRAFANA_PROM_URL": "TF_VAR_grafana_prom_url",
-            "GRAFANA_PROM_USER": "TF_VAR_grafana_prom_user",
-            "GRAFANA_LOKI_URL": "TF_VAR_grafana_loki_url",
-            "GRAFANA_LOKI_USER": "TF_VAR_grafana_loki_user",
-        }
-        grafana_present = []
-        grafana_missing = []
-        for env_key, tf_key in grafana_map.items():
-            val = os.environ.get(env_key, "")
-            if val:
-                env[tf_key] = val
-                grafana_present.append(env_key)
-            else:
-                grafana_missing.append(env_key)
+        # Surface telemetry coverage — terragrunt template reads GRAFANA_* env
+        # vars directly (no TF_VAR_ prefix needed).
+        grafana_keys = ["GRAFANA_API_KEY", "GRAFANA_SA_KEY", "GRAFANA_STACK_URL",
+                        "GRAFANA_PROM_URL", "GRAFANA_PROM_USER",
+                        "GRAFANA_LOKI_URL", "GRAFANA_LOKI_USER"]
+        grafana_present = [k for k in grafana_keys if env.get(k)]
+        grafana_missing = [k for k in grafana_keys if not env.get(k)]
         if grafana_present:
-            print(f"   📊 grafana TF_VARs set: {len(grafana_present)}/{len(grafana_map)} "
+            print(f"   📊 grafana env vars set: {len(grafana_present)}/{len(grafana_keys)} "
                   f"({', '.join(grafana_present)})", file=sys.stderr)
         if grafana_missing:
-            print(f"   ⚠️  grafana TF_VARs missing: {', '.join(grafana_missing)} — "
+            print(f"   ⚠️  grafana env vars missing: {', '.join(grafana_missing)} — "
                   f"telemetry will be disabled for those endpoints. Check ~/.odium/env.",
                   file=sys.stderr)
 
         try:
+            # terragrunt init is fast and idempotent — run it before every apply
+            # so the per-job dir is initialized on first use.
+            init_proc = subprocess.run(
+                ["terragrunt", "init"],
+                cwd=str(tg_dir), env=env,
+                capture_output=True, text=True, timeout=120,
+            )
+            if init_proc.returncode != 0:
+                return json.dumps({
+                    "status": "error",
+                    "stage": "init",
+                    "stdout": _truncate(init_proc.stdout),
+                    "stderr": _truncate(init_proc.stderr, 2000),
+                })
+
             proc = subprocess.run(
-                ["terraform", "apply", "-auto-approve"] + tf_vars,
-                cwd=str(tf_dir), env=env,
-                capture_output=True, text=True, timeout=300,
+                ["terragrunt", "apply", "-auto-approve"],
+                cwd=str(tg_dir), env=env,
+                capture_output=True, text=True, timeout=600,
             )
             result = {
                 "status": "success" if proc.returncode == 0 else "error",
+                "job_name": job_name,
+                "tg_dir": str(tg_dir),
                 "stdout": _truncate(proc.stdout),
                 "stderr": _truncate(proc.stderr, 2000),
             }
-            # Extract outputs if successful
             if proc.returncode == 0:
                 for output_name in ["public_ip", "sns_topic_arn"]:
                     out = subprocess.run(
-                        ["terraform", "output", "-raw", output_name],
-                        cwd=str(tf_dir), capture_output=True, text=True, timeout=10,
+                        ["terragrunt", "output", "-raw", output_name],
+                        cwd=str(tg_dir), env=env,
+                        capture_output=True, text=True, timeout=15,
                     )
                     if out.returncode == 0:
                         result[output_name] = out.stdout.strip()
 
-                # Save SSH key — always overwrite (each apply generates a new key).
-                # Prefer job-specific path; fall back to global.
-                job_dir = input.get("job_dir")
-                if job_dir:
-                    ssh_key_path = Path(job_dir).expanduser() / "ssh_key.pem"
-                else:
-                    ssh_key_path = Path(os.environ.get("ODM_SSH_KEY",
-                                       "~/.ssh/geo-odm-ec2.pem")).expanduser()
+                # Save SSH key (always overwrite — each apply generates a new key).
+                ssh_key_path = Path(job_dir).expanduser() / "ssh_key.pem"
                 key_out = subprocess.run(
-                    ["terraform", "output", "-raw", "private_key_pem"],
-                    cwd=str(tf_dir), capture_output=True, text=True, timeout=10,
+                    ["terragrunt", "output", "-raw", "private_key_pem"],
+                    cwd=str(tg_dir), env=env,
+                    capture_output=True, text=True, timeout=15,
                 )
                 if key_out.returncode == 0 and key_out.stdout.strip():
                     ssh_key_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1505,27 +1577,34 @@ def execute_tool(name: str, input: dict) -> str:
 
             return json.dumps(result)
         except subprocess.TimeoutExpired:
-            return json.dumps({"status": "error", "error": "terraform apply timed out (5 min)"})
+            return json.dumps({"status": "error", "error": "terragrunt apply timed out (10 min)"})
         except Exception as e:
             return json.dumps({"status": "error", "error": str(e)})
 
     if name == "ec2_status":
-        tf_dir = GEO_DIR / "infra" / "ec2"
-        ssh_key = _resolve_ssh_key(input.get("job_dir"), tf_dir)
+        job_dir = input.get("job_dir")
+        if not job_dir:
+            return json.dumps({"error": "job_dir is required (per-job terragrunt state lives there)"})
+        tg_dir = Path(job_dir).expanduser() / "ec2"
+        if not tg_dir.exists():
+            return json.dumps({"status": "no_instance", "note": f"No terragrunt dir at {tg_dir}"})
+        ssh_key = _resolve_ssh_key(job_dir)
 
-        # Get IP from terraform
+        env = os.environ.copy()
+        env["GEO_HOME"] = str(GEO_DIR)
         try:
             ip_out = subprocess.run(
-                ["terraform", "output", "-raw", "public_ip"],
-                cwd=str(tf_dir), capture_output=True, text=True, timeout=10,
+                ["terragrunt", "output", "-raw", "public_ip"],
+                cwd=str(tg_dir), env=env,
+                capture_output=True, text=True, timeout=15,
             )
             if ip_out.returncode != 0 or not ip_out.stdout.strip():
-                return json.dumps({"status": "no_instance", "note": "No active EC2 instance (terraform has no state)"})
+                return json.dumps({"status": "no_instance",
+                                   "note": "No active EC2 instance (terragrunt has no state)"})
             ip = ip_out.stdout.strip()
         except Exception as e:
             return json.dumps({"error": f"Could not get instance IP: {e}"})
 
-        # SSH in and get status
         ssh_cmd = ["ssh", "-i", str(ssh_key), "-o", "StrictHostKeyChecking=no",
                    "-o", "ConnectTimeout=5", f"ec2-user@{ip}",
                    "tail -50 /var/log/odm-bootstrap.log 2>/dev/null; "
@@ -1540,17 +1619,27 @@ def execute_tool(name: str, input: dict) -> str:
                 "stderr": _truncate(proc.stderr, 500) if proc.stderr else "",
             })
         except subprocess.TimeoutExpired:
-            return json.dumps({"status": "unreachable", "ip": ip, "note": "SSH timed out — instance may be starting up"})
+            return json.dumps({"status": "unreachable", "ip": ip,
+                               "note": "SSH timed out — instance may be starting up"})
         except Exception as e:
             return json.dumps({"error": f"SSH failed: {e}", "ip": ip})
 
     if name == "ec2_ssh":
-        tf_dir = GEO_DIR / "infra" / "ec2"
-        ssh_key = _resolve_ssh_key(input.get("job_dir"), tf_dir)
+        job_dir = input.get("job_dir")
+        if not job_dir:
+            return json.dumps({"error": "job_dir is required (per-job terragrunt state lives there)"})
+        tg_dir = Path(job_dir).expanduser() / "ec2"
+        if not tg_dir.exists():
+            return json.dumps({"error": f"No terragrunt dir at {tg_dir}"})
+        ssh_key = _resolve_ssh_key(job_dir)
+
+        env = os.environ.copy()
+        env["GEO_HOME"] = str(GEO_DIR)
         try:
             ip_out = subprocess.run(
-                ["terraform", "output", "-raw", "public_ip"],
-                cwd=str(tf_dir), capture_output=True, text=True, timeout=10,
+                ["terragrunt", "output", "-raw", "public_ip"],
+                cwd=str(tg_dir), env=env,
+                capture_output=True, text=True, timeout=15,
             )
             if ip_out.returncode != 0:
                 return json.dumps({"error": "No active EC2 instance"})
@@ -1577,7 +1666,9 @@ def execute_tool(name: str, input: dict) -> str:
     if name == "s3_download":
         job_dir = Path(input["job_dir"]).expanduser()
         bucket = input.get("bucket", "stratus-jrstear")
-        s3_prefix = input["s3_prefix"]
+        # Default s3_prefix to the job_dir basename — matches the new
+        # uncluttered upload pattern. Override only for older jobs at 'bsn/...'.
+        s3_prefix = input.get("s3_prefix") or job_dir.name
         s3_base = f"s3://{bucket}/{s3_prefix}"
         profile = os.environ.get("AWS_PROFILE", "default")
         aws_base = ["aws", "s3"]
@@ -1627,11 +1718,21 @@ def execute_tool(name: str, input: dict) -> str:
         return json.dumps({"s3_base": s3_base, "downloads": results})
 
     if name == "ec2_destroy":
-        tf_dir = GEO_DIR / "infra" / "ec2"
+        job_dir = input.get("job_dir")
+        if not job_dir:
+            return json.dumps({"error": "job_dir is required (per-job terragrunt state lives there)"})
+        tg_dir = Path(job_dir).expanduser() / "ec2"
+        if not tg_dir.exists():
+            return json.dumps({"status": "no_instance",
+                               "note": f"No terragrunt dir at {tg_dir} — nothing to destroy"})
+
+        env = os.environ.copy()
+        env["GEO_HOME"] = str(GEO_DIR)
+
         try:
             proc = subprocess.run(
-                ["terraform", "destroy", "-auto-approve"],
-                cwd=str(tf_dir),
+                ["terragrunt", "destroy", "-auto-approve"],
+                cwd=str(tg_dir), env=env,
                 capture_output=True, text=True, timeout=600,
             )
             stdout, stderr, rc = proc.stdout, proc.stderr, proc.returncode
@@ -1642,8 +1743,8 @@ def execute_tool(name: str, input: dict) -> str:
                 print("   ⚠️  SNS principal refresh error — retrying with -refresh=false",
                       file=sys.stderr)
                 proc = subprocess.run(
-                    ["terraform", "destroy", "-auto-approve", "-refresh=false"],
-                    cwd=str(tf_dir),
+                    ["terragrunt", "destroy", "-auto-approve", "-refresh=false"],
+                    cwd=str(tg_dir), env=env,
                     capture_output=True, text=True, timeout=600,
                 )
                 stdout = (stdout + "\n--- retry with -refresh=false ---\n" + proc.stdout)
@@ -1671,9 +1772,24 @@ def execute_tool(name: str, input: dict) -> str:
 
             if rc == 0 and not survivors:
                 status = "success"
+                # Auto-clean local terragrunt artifacts on successful destroy.
+                # State files have no value after teardown; cache may be huge.
+                cleaned = []
+                for pattern in [".terragrunt-cache", "terraform.tfstate",
+                                "terraform.tfstate.backup", ".terraform",
+                                ".terraform.lock.hcl"]:
+                    target = tg_dir / pattern
+                    if target.exists():
+                        if target.is_dir():
+                            shutil.rmtree(target)
+                        else:
+                            target.unlink()
+                        cleaned.append(pattern)
+                if cleaned:
+                    print(f"   🧹 cleaned: {', '.join(cleaned)}", file=sys.stderr)
             elif rc == 0 and survivors:
                 status = "partial"
-                stderr += (f"\n⚠️  terraform reported success but {len(survivors)} "
+                stderr += (f"\n⚠️  terragrunt reported success but {len(survivors)} "
                            f"odm-run instance(s) remain: {survivors}. "
                            f"Manual cleanup required (aws ec2 terminate-instances).")
             else:
@@ -1686,7 +1802,7 @@ def execute_tool(name: str, input: dict) -> str:
                 "survivors": survivors,
             })
         except subprocess.TimeoutExpired:
-            return json.dumps({"error": "terraform destroy timed out (10 min) — "
+            return json.dumps({"error": "terragrunt destroy timed out (10 min) — "
                                         "instance may still be live; check AWS console"})
         except Exception as e:
             return json.dumps({"error": str(e)})
