@@ -411,16 +411,27 @@ to figure out what you have**, then confirm with the user before proceeding.
 - 0 GCP or 0 CHK after split → user may not have assigned roles
 - Flag these immediately rather than rationalizing empty results.
 
-### Ortho-tagged file fallback (step 6b)
+### Tagged-file fallback (pre-ODM and step 6b)
 GCPEditorPro's "Download" button writes to the browser's download folder
-(`~/Downloads/` on macOS), NOT back into the job directory. So for step 6b:
-- Expected path: `{job_dir}/odm_orthophoto/odm_orthophoto.original_tagged.txt`
-- If missing there, ALWAYS check `~/Downloads/odm_orthophoto.original_tagged.txt`
-  (and any recent `*_tagged.txt` in `~/Downloads/`) before asking the user.
-- When you find it there, MOVE it into `{job_dir}/odm_orthophoto/` (don't
-  copy — keeps Downloads tidy and ensures only one canonical location).
-- Same fallback applies to `{job}_tagged.txt` for the pre-ODM tagging step:
-  check `~/Downloads/` before asking.
+(`~/Downloads/` on macOS), NOT back into the job directory. So when looking
+for a tagged file, ALWAYS follow this strict precedence:
+
+1. **First check the job dir.** If a tagged file already exists there, USE IT
+   AS-IS. Do NOT overwrite it from `~/Downloads/`. The user (or another
+   process) may have placed a hand-edited / scripted version there
+   intentionally — clobbering it destroys their work.
+   - Pre-ODM:  `{job_dir}/{job}_tagged.txt`
+   - Step 6b: `{job_dir}/odm_orthophoto/odm_orthophoto.original_tagged.txt`
+
+2. **Only if missing locally**, check `~/Downloads/` for the matching name
+   (and any recent `*_tagged.txt` if there's no exact match). When found,
+   MOVE it into the job dir (`mv`, not `cp` — keeps Downloads tidy and
+   leaves one canonical copy).
+
+3. **If both exist** (local AND Downloads), do NOT auto-pick. Stop and ask
+   the user which is the intended file: "I see `{job}_tagged.txt` in both
+   `{job_dir}/` and `~/Downloads/` — which should I use?" Show timestamps
+   and sizes for both.
 """
 
 TOOLS = [
