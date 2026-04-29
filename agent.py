@@ -753,9 +753,15 @@ TOOLS = [
     },
     {
         "name": "s3_download",
-        "description": "Download ODM results from S3. Only downloads what's needed "
-                       "for RMSE + packaging (not everything): reconstruction, "
-                       "orthophoto, cameras.json. Specify additional paths to include.",
+        "description": "Download the curated set of ODM outputs from S3 — only "
+                       "what's needed for the geo workflow downstream of ODM: "
+                       "reconstruction.topocentric.json, the raw orthophoto .tif, "
+                       "DTM + dtm_contours.gpkg (for the contour deliverable), "
+                       "odm_report/, cameras.json. The default list is correct; "
+                       "do NOT add extra_paths unless the user explicitly asks for "
+                       "something specific. In particular, NEVER add 'opensfm' or "
+                       "'images' as extras — those are 8-20 GB working dirs that "
+                       "fill local disk and aren't consumed by any geo tool.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -776,7 +782,20 @@ TOOLS = [
                 "extra_paths": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Additional S3 subdirs to download (e.g. ['odm_dem', 'odm_report'])",
+                    "description": "Additional S3 subdirs to download. WARNING: do "
+                                   "NOT include 'opensfm' or 'images' as a whole — "
+                                   "they are 8-20 GB each and rarely needed locally "
+                                   "(reconstruction.topocentric.json is already in "
+                                   "the default list; everything else under opensfm/ "
+                                   "is SfM working state). Use specific files only "
+                                   "if you really need something from those dirs.",
+                },
+                "force_dangerous_extras": {
+                    "type": "boolean",
+                    "description": "Bypass the guard against syncing 'opensfm' or "
+                                   "'images' as whole subdirs. Default false. Set "
+                                   "only if the user explicitly asked for the full "
+                                   "SfM tree or source images.",
                 },
             },
             "required": ["job_dir"],
@@ -1733,19 +1752,34 @@ def execute_tool(name: str, input: dict) -> str:
         if profile != "default":
             aws_base = ["aws", "--profile", profile, "s3"]
 
-        # Default: only what's needed for RMSE + packaging.
-        # Historical bug: syncing odm_orthophoto/ (trailing slash) pulled the
-        # 1.6 GB cloud-optimized .tif in addition to the 1.2 GB raw raster.
-        # rmse 6b only needs the raw raster; internal GeoTIFF tags carry
-        # georeferencing, so no sidecars required.
+        # Default: only what's needed for RMSE + packaging + contour deliverable.
+        # Historical bugs:
+        #  - syncing odm_orthophoto/ (trailing slash) pulled the 1.6 GB COG in
+        #    addition to the 1.2 GB raw raster. rmse 6b only needs the raw.
+        #  - extra_paths=['opensfm'] pulled 8+ GB of SfM working state when only
+        #    reconstruction.topocentric.json was needed (filled the user's
+        #    disk on aztec13). Now guarded below.
         downloads = [
             ("opensfm/reconstruction.topocentric.json", "opensfm/"),
             ("odm_orthophoto/odm_orthophoto.original.tif", "odm_orthophoto/"),
+            ("odm_dem/dtm.tif", "odm_dem/"),                # for contour deliverable (geo-btcl)
+            ("odm_dem/dtm_contours.gpkg", "odm_dem/"),       # ODM --contours output
             ("odm_report/", "odm_report/"),
             ("cameras.json", "."),
         ]
-        # Add extra paths if requested
+        # Add extra paths if requested.  Guard against syncing entire huge
+        # subdirs ('opensfm', 'images') unless explicitly forced.  These are
+        # ~8 GB and ~18 GB respectively at aztec scale and almost never needed
+        # locally — the curated defaults above already cover all known
+        # workflow consumers.
+        DANGEROUS_DIRS = {"opensfm", "images"}
+        force = bool(input.get("force_dangerous_extras", False))
+        skipped_dangerous = []
         for extra in input.get("extra_paths", []):
+            normalized = extra.strip("/").split("/", 1)[0]
+            if normalized in DANGEROUS_DIRS and not force:
+                skipped_dangerous.append(extra)
+                continue
             downloads.append((extra + "/", extra + "/"))
 
         results = {}
@@ -1773,7 +1807,15 @@ def execute_tool(name: str, input: dict) -> str:
             except Exception as e:
                 results[s3_path] = {"status": "error", "error": str(e)}
 
-        return json.dumps({"s3_base": s3_base, "downloads": results})
+        out = {"s3_base": s3_base, "downloads": results}
+        if skipped_dangerous:
+            out["skipped_dangerous_extras"] = skipped_dangerous
+            out["skipped_note"] = (
+                "Skipped these extras to protect local disk — they're huge subdirs "
+                "and the workflow rarely needs them. To override, re-run with "
+                "force_dangerous_extras=true."
+            )
+        return json.dumps(out)
 
     if name == "s3_list":
         bucket = input.get("bucket", "stratus-jrstear")
