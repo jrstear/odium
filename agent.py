@@ -783,6 +783,36 @@ TOOLS = [
         },
     },
     {
+        "name": "s3_list",
+        "description": "List objects in S3 under a prefix using `aws s3 ls --recursive` "
+                       "with the configured AWS_PROFILE. Use this to inspect what's in "
+                       "S3 (e.g. confirming an ODM run synced its outputs). Do NOT use "
+                       "fetch_url against S3 paths — anonymous HTTPS GET on a bucket "
+                       "returns 403 even when AWS CLI auth would succeed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "s3_prefix": {
+                    "type": "string",
+                    "description": "S3 path prefix to list (e.g. 'aztec13' or 'aztec13/odm_dem'). "
+                                   "Empty = list bucket root.",
+                },
+                "bucket": {
+                    "type": "string",
+                    "description": "S3 bucket name (default: stratus-jrstear)",
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "Recurse into subdirectories (default: true)",
+                },
+                "max_lines": {
+                    "type": "integer",
+                    "description": "Truncate output to this many lines (default: 200)",
+                },
+            },
+        },
+    },
+    {
         "name": "ec2_destroy",
         "description": "Tear down the EC2 instance via terragrunt destroy in "
                        "{job_dir}/ec2/. Cancels spot request, deletes EBS volume, "
@@ -1744,6 +1774,43 @@ def execute_tool(name: str, input: dict) -> str:
                 results[s3_path] = {"status": "error", "error": str(e)}
 
         return json.dumps({"s3_base": s3_base, "downloads": results})
+
+    if name == "s3_list":
+        bucket = input.get("bucket", "stratus-jrstear")
+        s3_prefix = (input.get("s3_prefix") or "").strip().lstrip("/")
+        recursive = input.get("recursive", True)
+        max_lines = int(input.get("max_lines") or 200)
+        s3_uri = f"s3://{bucket}/" + (f"{s3_prefix}/" if s3_prefix and not s3_prefix.endswith("/") else s3_prefix)
+
+        profile = os.environ.get("AWS_PROFILE", "default")
+        cmd = ["aws"]
+        if profile != "default":
+            cmd += ["--profile", profile]
+        cmd += ["s3", "ls", s3_uri]
+        if recursive:
+            cmd += ["--recursive"]
+        cmd += ["--summarize"]
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            stdout = proc.stdout or ""
+            lines = stdout.splitlines()
+            truncated = False
+            if len(lines) > max_lines:
+                lines = lines[:max_lines]
+                truncated = True
+            return json.dumps({
+                "status": "success" if proc.returncode == 0 else "error",
+                "s3_uri": s3_uri,
+                "lines": lines,
+                "truncated": truncated,
+                "stderr": _truncate(proc.stderr, 1000) if proc.stderr else "",
+                "returncode": proc.returncode,
+            })
+        except subprocess.TimeoutExpired:
+            return json.dumps({"status": "error", "error": "aws s3 ls timed out (60s)"})
+        except Exception as e:
+            return json.dumps({"status": "error", "error": str(e)})
 
     if name == "ec2_destroy":
         job_dir = input.get("job_dir")
